@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "PeopleDiff",
   description:
-    "Chinese and Japanese People's Daily narrative difference dashboard."
+    "Chinese and target-language People's Daily narrative difference dashboard."
 };
 
 export default function RootLayout({

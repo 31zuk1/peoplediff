@@ -6,11 +6,11 @@ This file is for coding agents working on PeopleDiff.
 
 PeopleDiff is not a news app and not a translation app.
 
-It is a PoC interface for observing how People's Daily changes selection, wording, body detail, and framing between the Chinese edition and the Japanese edition.
+It is a PoC interface for observing how People's Daily changes selection, wording, body detail, and framing between the Chinese edition and a selected target-language edition.
 
 Preserve this framing when changing the product:
 
-- Show selective visibility: what exists only in Chinese or only in Japanese.
+- Show selective visibility: what exists only in Chinese or only in the target language.
 - Show topic connection: what is the same story across editions.
 - Show narrative difference: what disappears, what is emphasized, and how political language changes.
 - Keep the UI closer to OSINT / policy analysis than a generic news reader.
@@ -29,26 +29,28 @@ Main entry points:
 - `components/Dashboard.tsx`: primary dashboard UI
 - `app/api/refresh/route.ts`: refresh/read API
 - `lib/scraper.ts`: article collection and body extraction
-- `lib/matcher.ts`: CN/JP article matching
+- `lib/matcher.ts`: CN/target article matching
 - `lib/openai.ts`: OpenAI enrichment and comparison
 - `lib/compare.ts`: refresh pipeline and stats
 - `lib/cache.ts`: latest and daily snapshot storage
+- `lib/languages.ts`: People's Daily language registry and source/target resolution
 - `lib/types.ts`: shared data types
 
 ## Core Semantics
 
 Do not change these labels casually.
 
-- `MATCHED`: CN and JP both cover the same topic. It does not mean there is no difference.
+- `MATCHED`: CN and the selected target language both cover the same topic. It does not mean there is no difference.
 - `CN ONLY`: an article appears only in the Chinese-side collection.
-- `JP ONLY`: an article appears only in the Japanese-side collection.
+- `JP ONLY`: an article appears only in the Japanese-side collection when the target language is JP.
+- `TARGET ONLY`: an article appears only in a non-JP target-language collection.
 - `BODY DIFF`: supplementary UI signal for differences in body detail, missing points, emphasized points, numbers, background, or specificity.
 - `FRAMING`: supplementary UI signal for differences in tone, value judgment, political language, or external-facing explanation.
 
 The top-level filter intentionally uses:
 
 ```text
-ALL / CN / JP / MATCHED
+ALL / CN / target language code / MATCHED
 ```
 
 Differences are shown inside `MATCHED` via badges and the comparison panel.
@@ -63,6 +65,8 @@ data/snapshots/YYYY-MM-DD.json
 data/snapshots/index.json
 ```
 
+`CN-JP` keeps these legacy file names. Other language pairs use language-qualified names such as `latest.CN-EN.json`, `YYYY-MM-DD.CN-EN.json`, and `index.CN-EN.json`.
+
 These JSON files are ignored by git. Do not commit scraped snapshot data unless the user explicitly asks for a fixture.
 
 `PEOPLEDIFF_DATA_DIR` can override the archive directory.
@@ -71,7 +75,7 @@ Important: Vercel serverless runtime writes are not durable. For real ongoing pr
 
 ## OpenAI Behavior
 
-`OPENAI_API_KEY` is optional. Without it, the app should still scrape and render heuristic summaries and matches.
+`OPENAI_API_KEY` is optional. Without it, the app should still scrape and render heuristic summaries and matches. For non-JP target languages, OpenAI translation materially improves matching quality because target titles and summaries are normalized into Japanese for analysis.
 
 When editing prompts in `lib/openai.ts`, keep this bias:
 
@@ -91,6 +95,7 @@ When changing `lib/scraper.ts`:
 - Keep deduplication.
 - Preserve `urlDate`, `publishedDate`, and `dateMismatch`.
 - Do not assume URL date and body date are always identical.
+- Use `lib/languages.ts` for People's Daily edition URLs, article hosts, and per-language defaults.
 - Avoid brittle parsing that depends on one exact template.
 
 ## Matching Guidance
@@ -103,6 +108,7 @@ When changing `lib/matcher.ts`:
 - Use translated title, raw title, aliases, keywords, and category hints together.
 - Preserve the meaning that matched topic pairs should be displayed as `MATCHED`.
 - Keep difference classification separate from match status.
+- Keep the base language conceptually CN for now, even though the data model uses `base`/`target` names for forward compatibility.
 
 ## UI Guidance
 
@@ -152,6 +158,7 @@ Optional:
 
 ```bash
 OPENAI_MODEL=gpt-4o-mini
+PEOPLEDIFF_AI_ARTICLE_LIMIT=80
 PEOPLEDIFF_DATA_DIR=/absolute/path/to/snapshots
 ```
 

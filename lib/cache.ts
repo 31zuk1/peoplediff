@@ -1,126 +1,192 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import type { Source } from "./types";
 import type { Article, ArticlePair, RefreshResult } from "./types";
 import { calculateStats, emptySnapshot } from "./compare";
+import { getAvailableLanguageSummaries, resolveCompareLanguages } from "./languages";
 
 const LEGACY_CACHE_PATH = path.join("/tmp", "peoplediff-cache.json");
-const PRIMARY_ARCHIVE_DIR =
-  process.env.PEOPLEDIFF_DATA_DIR || path.join(process.cwd(), "data", "snapshots");
 const FALLBACK_ARCHIVE_DIR = path.join("/tmp", "peoplediff-snapshots");
+const PROJECT_ARCHIVE_DIR = path.join(process.cwd(), "data", "snapshots");
 const LATEST_FILE = "latest.json";
 const INDEX_FILE = "index.json";
+const DEFAULT_COMPARISON_KEY = "CN-JP";
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 declare global {
   // eslint-disable-next-line no-var
   var __PEOPLEDIFF_CACHE__: RefreshResult | undefined;
   // eslint-disable-next-line no-var
+  var __PEOPLEDIFF_CACHE_BY_KEY__: Record<string, RefreshResult> | undefined;
+  // eslint-disable-next-line no-var
   var __PEOPLEDIFF_CACHE_BY_DATE__: Record<string, RefreshResult> | undefined;
   // eslint-disable-next-line no-var
   var __PEOPLEDIFF_WRITABLE_DIR__: string | undefined;
 }
 
-export async function readSnapshot(date?: string) {
-  const normalizedDate = normalizeArchiveDate(date);
-  if (normalizedDate) return readDatedSnapshot(normalizedDate);
+type SnapshotReadOptions = {
+  sourceLanguage?: unknown;
+  targetLanguage?: unknown;
+  source?: unknown;
+  target?: unknown;
+};
 
-  if (globalThis.__PEOPLEDIFF_CACHE__) {
+export async function readSnapshot(date?: string, options: SnapshotReadOptions = {}) {
+  const languageSelection = resolveCompareLanguages(options);
+  const key = comparisonKey(languageSelection.sourceLanguage, languageSelection.targetLanguage);
+  const normalizedDate = normalizeArchiveDate(date);
+  if (normalizedDate) return readDatedSnapshot(normalizedDate, key);
+
+  const cachedByKey = globalThis.__PEOPLEDIFF_CACHE_BY_KEY__?.[key];
+  if (cachedByKey) {
+    return withArchiveDates(cachedByKey, undefined, key);
+  }
+
+  if (key === DEFAULT_COMPARISON_KEY && globalThis.__PEOPLEDIFF_CACHE__) {
     return withArchiveDates(globalThis.__PEOPLEDIFF_CACHE__);
   }
 
   const latest = await readFirstJson<RefreshResult>(
-    archiveDirs().map((dir) => path.join(dir, LATEST_FILE))
+    archiveDirs().map((dir) => path.join(dir, latestFileName(key)))
   );
   if (latest) {
-    globalThis.__PEOPLEDIFF_CACHE__ = stripArchiveMetadata(latest);
-    return withArchiveDates(globalThis.__PEOPLEDIFF_CACHE__);
+    const cleanSnapshot = stripArchiveMetadata(latest);
+    rememberSnapshot(cleanSnapshot, key);
+    return withArchiveDates(cleanSnapshot, undefined, key);
   }
 
-  const latestDate = (await listArchiveDates())[0];
-  if (latestDate) return readDatedSnapshot(latestDate);
+  const latestDate = (await listArchiveDates(key))[0];
+  if (latestDate) return readDatedSnapshot(latestDate, key);
 
-  const legacy = await readFirstJson<RefreshResult>([LEGACY_CACHE_PATH]);
+  const legacy = key === DEFAULT_COMPARISON_KEY ? await readFirstJson<RefreshResult>([LEGACY_CACHE_PATH]) : undefined;
   if (legacy) {
     globalThis.__PEOPLEDIFF_CACHE__ = stripArchiveMetadata(legacy);
     return withArchiveDates(globalThis.__PEOPLEDIFF_CACHE__);
   }
 
-  return withArchiveDates(emptySnapshot());
+  return withArchiveDates(
+    {
+      ...emptySnapshot(),
+      baseLanguage: languageSelection.sourceLanguage,
+      targetLanguage: languageSelection.targetLanguage
+    },
+    undefined,
+    key
+  );
 }
 
 export async function writeSnapshot(snapshot: RefreshResult) {
   const cleanSnapshot = stripArchiveMetadata(snapshot);
   const writableDir = await writableArchiveDir();
   const dailySnapshots = splitSnapshotByDate(cleanSnapshot);
+  const key = comparisonKeyFromSnapshot(cleanSnapshot);
 
-  globalThis.__PEOPLEDIFF_CACHE__ = cleanSnapshot;
+  rememberSnapshot(cleanSnapshot, key);
   globalThis.__PEOPLEDIFF_CACHE_BY_DATE__ = {
     ...(globalThis.__PEOPLEDIFF_CACHE_BY_DATE__ ?? {}),
-    ...Object.fromEntries(dailySnapshots)
+    ...Object.fromEntries([...dailySnapshots].map(([date, daily]) => [datedCacheKey(date, key), daily]))
   };
 
   if (writableDir) {
-    await writeJson(path.join(writableDir, LATEST_FILE), cleanSnapshot);
+    await writeJson(path.join(writableDir, latestFileName(key)), cleanSnapshot);
     await Promise.all(
       [...dailySnapshots].map(([date, dailySnapshot]) =>
-        writeJson(path.join(writableDir, `${date}.json`), dailySnapshot)
+        writeJson(path.join(writableDir, datedFileName(date, key)), dailySnapshot)
       )
     );
-    await writeIndex(writableDir);
+    await writeIndex(writableDir, key);
   }
 
-  return withArchiveDates(cleanSnapshot);
+  return withArchiveDates(cleanSnapshot, undefined, key);
 }
 
-async function readDatedSnapshot(date: string) {
-  const cached = globalThis.__PEOPLEDIFF_CACHE_BY_DATE__?.[date];
-  if (cached) return withArchiveDates(cached, date);
+async function readDatedSnapshot(date: string, key = DEFAULT_COMPARISON_KEY) {
+  const cached = globalThis.__PEOPLEDIFF_CACHE_BY_DATE__?.[datedCacheKey(date, key)];
+  if (cached) return withArchiveDates(cached, date, key);
 
   const archived = await readFirstJson<RefreshResult>(
-    archiveDirs().map((dir) => path.join(dir, `${date}.json`))
+    archiveDirs().map((dir) => path.join(dir, datedFileName(date, key)))
   );
   if (archived) {
     const cleanSnapshot = stripArchiveMetadata(archived);
     globalThis.__PEOPLEDIFF_CACHE_BY_DATE__ = {
       ...(globalThis.__PEOPLEDIFF_CACHE_BY_DATE__ ?? {}),
-      [date]: cleanSnapshot
+      [datedCacheKey(date, key)]: cleanSnapshot
     };
-    return withArchiveDates(cleanSnapshot, date);
+    return withArchiveDates(cleanSnapshot, date, key);
   }
 
+  const [baseLanguage, targetLanguage] = languagesFromKey(key);
   const empty = {
     ...emptySnapshot(),
+    baseLanguage,
+    targetLanguage,
     dateScope: [date]
   };
-  return withArchiveDates(empty, date);
+  return withArchiveDates(empty, date, key);
 }
 
-async function withArchiveDates(snapshot: RefreshResult, activeDate?: string): Promise<RefreshResult> {
+async function withArchiveDates(
+  snapshot: RefreshResult,
+  activeDate?: string,
+  key = comparisonKeyFromSnapshot(snapshot)
+): Promise<RefreshResult> {
+  const baseLanguage = snapshot.baseLanguage ?? "CN";
+  const targetLanguage = snapshot.targetLanguage ?? "JP";
+  const baseArticles = snapshot.baseArticles ?? snapshot.cnArticles ?? [];
+  const targetArticles = snapshot.targetArticles ?? snapshot.jpArticles ?? [];
+  const dateScope = snapshot.dateScope ?? snapshot.targetDateScope ?? [];
+
   return {
     ...snapshot,
+    schemaVersion: snapshot.schemaVersion ?? 1,
+    baseLanguage,
+    targetLanguage,
+    availableLanguages: snapshot.availableLanguages ?? getAvailableLanguageSummaries(),
+    dateScope,
+    sourceDateScope: snapshot.sourceDateScope ?? dateScope,
+    targetDateScope: snapshot.targetDateScope ?? dateScope,
+    sourceLookbackDays: snapshot.sourceLookbackDays ?? 3,
+    baseArticles,
+    targetArticles,
+    cnArticles: snapshot.cnArticles ?? baseArticles,
+    jpArticles: targetLanguage === "JP" ? (snapshot.jpArticles ?? targetArticles) : [],
     activeDate,
-    archiveDates: await listArchiveDates()
+    archiveDates: await listArchiveDates(key)
   };
 }
 
 function splitSnapshotByDate(snapshot: RefreshResult) {
   const dates = collectSnapshotDates(snapshot);
   const dailySnapshots = new Map<string, RefreshResult>();
+  const baseSource = snapshot.baseArticles ?? snapshot.cnArticles;
+  const targetSource = snapshot.targetArticles ?? snapshot.jpArticles;
 
   for (const date of dates) {
     const pairs = snapshot.pairs.filter((pair) => pairTouchesDate(pair, date));
-    const cnArticles = collectArticlesForDate(snapshot.cnArticles, pairs, "cn", date);
-    const jpArticles = collectArticlesForDate(snapshot.jpArticles, pairs, "jp", date);
+    const baseArticles = collectArticlesForDate(baseSource, pairs, "base", date);
+    const targetArticles = collectArticlesForDate(targetSource, pairs, "target", date);
 
     dailySnapshots.set(date, {
       ...snapshot,
       activeDate: undefined,
       archiveDates: undefined,
       dateScope: [date],
-      cnArticles,
-      jpArticles,
+      sourceDateScope: collectArticleDateScope(baseArticles),
+      targetDateScope: collectArticleDateScope(targetArticles),
+      sourceLookbackDays: snapshot.sourceLookbackDays,
+      baseArticles,
+      targetArticles,
+      cnArticles: baseArticles,
+      jpArticles: snapshot.targetLanguage === "JP" ? targetArticles : [],
       pairs,
-      stats: calculateStats(pairs, cnArticles.length, jpArticles.length)
+      stats: calculateStats(
+        pairs,
+        baseArticles.length,
+        targetArticles.length,
+        snapshot.baseLanguage ?? "CN",
+        snapshot.targetLanguage ?? "JP"
+      )
     });
   }
 
@@ -135,7 +201,10 @@ function collectSnapshotDates(snapshot: RefreshResult) {
     if (normalized) values.add(normalized);
   });
 
-  [...snapshot.cnArticles, ...snapshot.jpArticles].forEach((article) => {
+  [
+    ...(snapshot.baseArticles ?? snapshot.cnArticles),
+    ...(snapshot.targetArticles ?? snapshot.jpArticles)
+  ].forEach((article) => {
     const normalized = normalizeArchiveDate(articleDate(article));
     if (normalized) values.add(normalized);
   });
@@ -146,7 +215,7 @@ function collectSnapshotDates(snapshot: RefreshResult) {
 function collectArticlesForDate(
   articles: Article[],
   pairs: ArticlePair[],
-  side: "cn" | "jp",
+  side: "base" | "target",
   date: string
 ) {
   const byId = new Map<string, Article>();
@@ -156,22 +225,35 @@ function collectArticlesForDate(
   });
 
   pairs.forEach((pair) => {
-    const article = pair[side];
+    const article = side === "base" ? pair.base ?? pair.cn : pair.target ?? pair.jp;
     if (article) byId.set(article.id, article);
   });
 
   return [...byId.values()];
 }
 
+function collectArticleDateScope(articles: Article[]) {
+  return [
+    ...new Set(
+      articles
+        .map((article) => normalizeArchiveDate(articleDate(article)))
+        .filter((date): date is string => Boolean(date && isDate(date)))
+    )
+  ].sort((a, b) => b.localeCompare(a));
+}
+
 function pairTouchesDate(pair: ArticlePair, date: string) {
-  return articleDate(pair.cn) === date || articleDate(pair.jp) === date;
+  return (
+    articleDate(pair.base ?? pair.cn) === date ||
+    articleDate(pair.target ?? pair.jp) === date
+  );
 }
 
 function articleDate(article?: Article) {
   return article?.urlDate || article?.publishedDate;
 }
 
-async function listArchiveDates() {
+async function listArchiveDates(key = DEFAULT_COMPARISON_KEY) {
   const files = await Promise.all(
     archiveDirs().map(async (dir) => {
       try {
@@ -182,7 +264,7 @@ async function listArchiveDates() {
     })
   );
 
-  return [...new Set(files.flat().map((file) => file.replace(/\.json$/, "")).filter(isDate))]
+  return [...new Set(files.flat().map((file) => archiveDateFromFile(file, key)).filter(isDate))]
     .sort((a, b) => b.localeCompare(a));
 }
 
@@ -206,13 +288,20 @@ async function writableArchiveDir() {
 }
 
 function archiveDirs() {
-  return [...new Set([PRIMARY_ARCHIVE_DIR, FALLBACK_ARCHIVE_DIR])];
+  return [...new Set([primaryArchiveDir(), FALLBACK_ARCHIVE_DIR])];
 }
 
-async function writeIndex(dir: string) {
-  const dates = await listArchiveDates();
-  await writeJson(path.join(dir, INDEX_FILE), {
+function primaryArchiveDir() {
+  const override = process.env.PEOPLEDIFF_DATA_DIR?.trim();
+  if (override) return path.resolve(override);
+  return PROJECT_ARCHIVE_DIR;
+}
+
+async function writeIndex(dir: string, key = DEFAULT_COMPARISON_KEY) {
+  const dates = await listArchiveDates(key);
+  await writeJson(path.join(dir, indexFileName(key)), {
     updatedAt: new Date().toISOString(),
+    comparisonKey: key,
     dates
   });
 }
@@ -239,12 +328,71 @@ function stripArchiveMetadata(snapshot: RefreshResult): RefreshResult {
   return rest;
 }
 
+function rememberSnapshot(snapshot: RefreshResult, key: string) {
+  globalThis.__PEOPLEDIFF_CACHE_BY_KEY__ = {
+    ...(globalThis.__PEOPLEDIFF_CACHE_BY_KEY__ ?? {}),
+    [key]: snapshot
+  };
+
+  if (key === DEFAULT_COMPARISON_KEY) {
+    globalThis.__PEOPLEDIFF_CACHE__ = snapshot;
+  }
+}
+
+function comparisonKeyFromSnapshot(snapshot: RefreshResult) {
+  return comparisonKey(snapshot.baseLanguage ?? "CN", snapshot.targetLanguage ?? "JP");
+}
+
+function comparisonKey(sourceLanguage: Source, targetLanguage: Source) {
+  return `${sourceLanguage}-${targetLanguage}`;
+}
+
+function languagesFromKey(key: string): [Source, Source] {
+  const [source = "CN", target = "JP"] = key.split("-");
+  return [source as Source, target as Source];
+}
+
+function latestFileName(key: string) {
+  return key === DEFAULT_COMPARISON_KEY ? LATEST_FILE : `latest.${key}.json`;
+}
+
+function datedFileName(date: string, key: string) {
+  return key === DEFAULT_COMPARISON_KEY ? `${date}.json` : `${date}.${key}.json`;
+}
+
+function indexFileName(key: string) {
+  return key === DEFAULT_COMPARISON_KEY ? INDEX_FILE : `index.${key}.json`;
+}
+
+function datedCacheKey(date: string, key: string) {
+  return `${key}:${date}`;
+}
+
+function archiveDateFromFile(file: string, key: string) {
+  if (key === DEFAULT_COMPARISON_KEY) {
+    const value = file.replace(/\.json$/, "");
+    return isDate(value) ? value : "";
+  }
+
+  const suffix = `.${key}.json`;
+  if (!file.endsWith(suffix)) return "";
+  return file.slice(0, -suffix.length);
+}
+
 function normalizeArchiveDate(input?: string) {
   const match = input?.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (!match) return undefined;
-  return `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
+  const normalized = `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
+  return isRealDate(normalized) ? normalized : undefined;
 }
 
 function isDate(input: string) {
-  return DATE_PATTERN.test(input);
+  return DATE_PATTERN.test(input) && isRealDate(input);
+}
+
+function isRealDate(input: string) {
+  const [year, month, day] = input.split("-").map(Number);
+  if (!year || !month || !day) return false;
+  const value = new Date(Date.UTC(year, month - 1, day));
+  return value.toISOString().slice(0, 10) === input;
 }

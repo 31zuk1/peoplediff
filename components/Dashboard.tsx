@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import clsx from "clsx";
 import {
   Activity,
@@ -24,22 +24,36 @@ type Props = {
   initialData: RefreshResult;
 };
 
-type StatusFilter = "ALL" | "CN ONLY" | "JP ONLY" | "MATCHED";
+type StatusFilter = "ALL" | "BASE_ONLY" | "TARGET_ONLY" | "MATCHED";
+type LanguageRole = "base" | "target";
+
+type LanguageOption = {
+  code: Source;
+  name: string;
+  nativeName: string;
+  editionLabel: string;
+  group: "base" | "foreign" | "ethnic";
+  source: Source;
+  enabled: boolean;
+};
+
+type LanguagePairConfig = {
+  id: string;
+  base: LanguageOption;
+  target: LanguageOption;
+};
 
 const statusOrder: StatusFilter[] = [
   "ALL",
-  "CN ONLY",
-  "JP ONLY",
+  "BASE_ONLY",
+  "TARGET_ONLY",
   "MATCHED"
 ];
 
-const statusCopy: Record<PairStatus, string> = {
-  MATCHED: "対応あり",
-  "CN ONLY": "中国語版のみ",
-  "JP ONLY": "日本語版のみ",
-  "FRAMING SHIFT": "論調差分",
-  "BODY DIFFERENCE": "本文差分"
-};
+const controlBase =
+  "h-11 w-full min-w-0 rounded-md border border-white/10 bg-white/[0.04] text-sm text-white outline-none transition focus:border-cyan-200/50 focus:bg-white/[0.055]";
+const controlIconClass =
+  "pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500";
 
 export default function Dashboard({ initialData }: Props) {
   const [data, setData] = useState(initialData);
@@ -47,16 +61,38 @@ export default function Dashboard({ initialData }: Props) {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<StatusFilter>("ALL");
   const [category, setCategory] = useState("ALL");
+  const [targetLanguage, setTargetLanguage] = useState<Source>(
+    initialData.targetLanguage ?? "JP"
+  );
   const [selectedArchiveDate, setSelectedArchiveDate] = useState(initialData.activeDate ?? "LATEST");
+  const [dateFrom, setDateFrom] = useState(() => dateRangeFromScope(initialData.dateScope).from);
+  const [dateTo, setDateTo] = useState(() => dateRangeFromScope(initialData.dateScope).to);
+  const [errorMessage, setErrorMessage] = useState("");
+  const [cacheNotice, setCacheNotice] = useState("");
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [themeReady, setThemeReady] = useState(false);
   const [isPending, startTransition] = useTransition();
+  const snapshotCacheRef = useRef<Map<string, RefreshResult>>(new Map());
+  const languageOptions = useMemo(() => getLanguageOptions(data), [data]);
+  const baseLanguage = data.baseLanguage ?? "CN";
+  const languagePair = useMemo(
+    () => makeLanguagePair(languageOptions, baseLanguage, targetLanguage),
+    [baseLanguage, languageOptions, targetLanguage]
+  );
 
   useEffect(() => {
     const saved = window.localStorage.getItem("peoplediff-theme");
     if (saved === "light" || saved === "dark") setTheme(saved);
     setThemeReady(true);
   }, []);
+
+  useEffect(() => {
+    rememberClientSnapshot(snapshotCacheRef.current, initialData);
+  }, [initialData]);
+
+  useEffect(() => {
+    rememberClientSnapshot(snapshotCacheRef.current, data);
+  }, [data]);
 
   useEffect(() => {
     if (!themeReady) return;
@@ -67,30 +103,47 @@ export default function Dashboard({ initialData }: Props) {
     setSelectedArchiveDate(data.activeDate ?? "LATEST");
   }, [data.activeDate, data.generatedAt]);
 
+  useEffect(() => {
+    if (data.targetLanguage) setTargetLanguage(data.targetLanguage);
+  }, [data.targetLanguage]);
+
+  useEffect(() => {
+    const nextRange = dateRangeFromScope(
+      data.targetDateScope?.length ? data.targetDateScope : data.dateScope
+    );
+    setDateFrom(nextRange.from);
+    setDateTo(nextRange.to);
+  }, [data.dateScope, data.generatedAt, data.targetDateScope]);
+
   const filteredPairs = useMemo(() => {
     const q = query.trim().toLowerCase();
     return data.pairs.filter((pair) => {
+      const baseArticle = getRoleArticle(pair, "base", languagePair);
+      const targetArticle = getRoleArticle(pair, "target", languagePair);
       const haystack = [
-        pair.cn?.title,
-        pair.cn?.translatedTitle,
-        pair.jp?.title,
-        pair.cn?.summary,
-        pair.jp?.summary,
-        pair.cn?.category,
-        pair.jp?.category,
+        baseArticle?.title,
+        baseArticle?.translatedTitle,
+        targetArticle?.title,
+        targetArticle?.translatedTitle,
+        baseArticle?.summary,
+        targetArticle?.summary,
+        baseArticle?.category,
+        targetArticle?.category,
         pair.highlights.join(" ")
       ]
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
       const categoryHit =
-        category === "ALL" || pair.cn?.category === category || pair.jp?.category === category;
-      const statusHit = matchesStatusFilter(pair, status);
+        category === "ALL" ||
+        baseArticle?.category === category ||
+        targetArticle?.category === category;
+      const statusHit = matchesStatusFilter(pair, status, languagePair);
       const queryHit = !q || haystack.includes(q);
 
-      return categoryHit && statusHit && queryHit;
+      return Boolean(baseArticle || targetArticle) && categoryHit && statusHit && queryHit;
     });
-  }, [category, data.pairs, query, status]);
+  }, [category, data.pairs, languagePair, query, status]);
 
   useEffect(() => {
     if (!filteredPairs.length) return;
@@ -102,11 +155,13 @@ export default function Dashboard({ initialData }: Props) {
   const categories = useMemo(() => {
     const values = new Set<string>();
     data.pairs.forEach((pair) => {
-      if (pair.cn?.category) values.add(pair.cn.category);
-      if (pair.jp?.category) values.add(pair.jp.category);
+      const baseArticle = getRoleArticle(pair, "base", languagePair);
+      const targetArticle = getRoleArticle(pair, "target", languagePair);
+      if (baseArticle?.category) values.add(baseArticle.category);
+      if (targetArticle?.category) values.add(targetArticle.category);
     });
     return ["ALL", ...[...values].sort((a, b) => a.localeCompare(b, "ja"))];
-  }, [data.pairs]);
+  }, [data.pairs, languagePair]);
 
   const archiveDates = useMemo(() => {
     const values = new Set<string>();
@@ -116,39 +171,96 @@ export default function Dashboard({ initialData }: Props) {
     return [...values].sort((a, b) => b.localeCompare(a));
   }, [data.archiveDates]);
 
-  const cnRows = filteredPairs.filter((pair) => pair.cn);
-  const jpRows = filteredPairs.filter((pair) => pair.jp);
+  const baseRows = filteredPairs.filter((pair) => getRoleArticle(pair, "base", languagePair));
+  const targetRows = filteredPairs.filter((pair) =>
+    getRoleArticle(pair, "target", languagePair)
+  );
   const selected = filteredPairs.find((pair) => pair.id === selectedId) ?? filteredPairs[0];
-  const activeLens = getLensCopy(status);
+  const activeLens = getLensCopy(status, languagePair);
+  const selectedDateScope = useMemo(() => dateScopeFromRange(dateFrom, dateTo), [dateFrom, dateTo]);
 
-  function refresh() {
+  function showSnapshot(next: RefreshResult) {
+    setData(next);
+    setSelectedId(next.pairs[0]?.id ?? "");
+  }
+
+  function showCachedSnapshot(next: RefreshResult, nextTarget: Source, nextDate: string) {
+    setErrorMessage("");
+    setCacheNotice(`キャッシュから再表示: CN / ${nextTarget} ${snapshotScopeLabel(next, nextDate)}`);
+    showSnapshot(next);
+  }
+
+  function refresh(nextTarget = targetLanguage) {
+    const selectedDates = selectedDateScope;
+    if (!selectedDates.length) return;
     startTransition(async () => {
-      const response = await fetch("/api/refresh", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          dates: recentDateScope(),
-          maxPages: 8,
-          maxArticles: 240
-        })
-      });
-      const next = (await response.json()) as RefreshResult;
-      setData(next);
-      setSelectedId(next.pairs[0]?.id ?? "");
+      setErrorMessage("");
+      setCacheNotice("");
+      try {
+        const response = await fetch("/api/refresh", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            dates: selectedDates,
+            targetDates: selectedDates,
+            dateFrom,
+            dateTo,
+            sourceLookbackDays: 1,
+            sourceLanguage: "CN",
+            targetLanguage: nextTarget,
+            maxPages: 8,
+            maxArticles: 240,
+            aiArticleLimit: 80,
+            cacheTtlSeconds: 1800
+          })
+        });
+        const next = await parseSnapshotResponse(response);
+        if (response.headers.get("x-peoplediff-cache") === "hit") {
+          setCacheNotice(`サーバーキャッシュから再表示: CN / ${nextTarget} ${snapshotScopeLabel(next, "LATEST")}`);
+        }
+        showSnapshot(next);
+      } catch (error) {
+        setErrorMessage(`更新に失敗しました: ${readableError(error)}`);
+      }
     });
   }
 
-  function loadArchiveDate(nextDate: string) {
+  function loadArchiveDate(nextDate: string, nextTarget = targetLanguage) {
     setSelectedArchiveDate(nextDate);
+    if (nextDate !== "LATEST") {
+      setDateFrom(nextDate);
+      setDateTo(nextDate);
+    }
+
+    const cached = findClientSnapshot(snapshotCacheRef.current, {
+      sourceLanguage: "CN",
+      targetLanguage: nextTarget,
+      archiveDate: nextDate,
+      dates: nextDate !== "LATEST" ? [nextDate] : selectedDateScope
+    });
+    if (cached) {
+      showCachedSnapshot(cached, nextTarget, nextDate);
+      return;
+    }
+
     startTransition(async () => {
-      const queryString = nextDate === "LATEST" ? "" : `?date=${encodeURIComponent(nextDate)}`;
-      const response = await fetch(`/api/refresh${queryString}`, {
-        method: "GET",
-        cache: "no-store"
-      });
-      const next = (await response.json()) as RefreshResult;
-      setData(next);
-      setSelectedId(next.pairs[0]?.id ?? "");
+      setErrorMessage("");
+      setCacheNotice("");
+      try {
+        const params = new URLSearchParams({
+          sourceLanguage: "CN",
+          targetLanguage: nextTarget
+        });
+        if (nextDate !== "LATEST") params.set("date", nextDate);
+        const response = await fetch(`/api/refresh?${params.toString()}`, {
+          method: "GET",
+          cache: "no-store"
+        });
+        const next = await parseSnapshotResponse(response);
+        showSnapshot(next);
+      } catch (error) {
+        setErrorMessage(`アーカイブの読み込みに失敗しました: ${readableError(error)}`);
+      }
     });
   }
 
@@ -175,22 +287,50 @@ export default function Dashboard({ initialData }: Props) {
               </span>
               {data.dateScope?.length ? (
                 <span className="rounded border border-emerald-200/20 bg-emerald-300/10 px-2.5 py-1 text-emerald-100/80">
-                  {data.dateScope.join(" / ")}
+                  対象期間 {formatScopeRange(data.targetDateScope?.length ? data.targetDateScope : data.dateScope)}
                 </span>
               ) : null}
             </div>
             <h1 className="text-balance text-3xl font-semibold tracking-normal text-white sm:text-5xl">
               PeopleDiff
             </h1>
-            <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-300">
-              人民網の中国語版と日本語版を接続し、記事選択、本文量、政治表現、対外向けフレーミングの差分を観測するPoC。
+            <p className="mt-3 max-w-none text-sm leading-6 text-slate-300 xl:whitespace-nowrap">
+              人民網の基準言語版と対象言語版を接続し、記事選択、本文量、政治表現、対外向けフレーミングの差分を観測するPoC。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2 lg:justify-end">
+            <label className="relative block h-11 min-w-[15rem]">
+              <Languages className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-cyan-100/70" />
+              <select
+                value={targetLanguage}
+                onChange={(event) => {
+                  const nextTarget = event.target.value as Source;
+                  setTargetLanguage(nextTarget);
+                  setStatus("ALL");
+                  setCategory("ALL");
+                  loadArchiveDate(selectedArchiveDate, nextTarget);
+                }}
+                className={`${controlBase} appearance-none pl-10 pr-8 font-semibold`}
+                aria-label="対象言語を選択"
+              >
+                {languageOptions
+                  .filter((language) => language.source !== "CN")
+                  .map((language) => (
+                    <option
+                      key={language.source}
+                      value={language.source}
+                      disabled={!language.enabled}
+                      className="bg-slate-950"
+                    >
+                      CN / {language.source} - {language.nativeName}
+                    </option>
+                  ))}
+              </select>
+            </label>
             <button
               type="button"
               onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
-              className="theme-toggle inline-flex h-11 items-center gap-2 rounded border border-white/10 bg-white/[0.04] px-3 text-sm font-semibold text-slate-200 transition hover:bg-white/[0.07]"
+              className="theme-toggle inline-flex h-11 min-w-[6.5rem] items-center justify-center gap-2 rounded-md border border-white/10 bg-white/[0.04] px-3 text-sm font-semibold text-slate-200 transition hover:bg-white/[0.07]"
               aria-label={theme === "dark" ? "ライトモードに切り替え" : "ダークモードに切り替え"}
             >
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -198,9 +338,9 @@ export default function Dashboard({ initialData }: Props) {
             </button>
             <button
               type="button"
-              onClick={refresh}
-              disabled={isPending}
-              className="inline-flex h-11 items-center gap-2 rounded border border-emerald-300/30 bg-emerald-300/14 px-4 text-sm font-semibold text-emerald-50 transition hover:bg-emerald-300/20 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={() => refresh()}
+              disabled={isPending || selectedDateScope.length === 0}
+              className="inline-flex h-11 min-w-[10rem] items-center justify-center gap-2 rounded-md border border-emerald-300/30 bg-emerald-300/14 px-4 text-sm font-semibold text-emerald-50 transition hover:bg-emerald-300/20 disabled:cursor-not-allowed disabled:opacity-60"
             >
               <RefreshCw className={clsx("h-4 w-4", isPending && "animate-spin")} />
               最新記事を更新
@@ -209,8 +349,16 @@ export default function Dashboard({ initialData }: Props) {
         </header>
 
         <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-          <Metric icon={Globe2} label="CN articles" value={data.stats.cnCount} />
-          <Metric icon={Languages} label="JP articles" value={data.stats.jpCount} />
+          <Metric
+            icon={Globe2}
+            label={`Base ${languagePair.base.code}`}
+            value={getSourceCount(data, languagePair.base.source)}
+          />
+          <Metric
+            icon={Languages}
+            label={`Target ${languagePair.target.code}`}
+            value={getSourceCount(data, languagePair.target.source)}
+          />
           <Metric icon={ShieldCheck} label="Coverage" value={`${data.stats.coverageRatio}%`} />
           <Metric
             icon={Sparkles}
@@ -226,39 +374,77 @@ export default function Dashboard({ initialData }: Props) {
           </div>
         ) : null}
 
-        <section className="grid gap-3 border-y border-white/10 py-4 xl:grid-cols-[minmax(220px,1fr)_minmax(280px,24rem)_minmax(10rem,12rem)_minmax(11rem,13rem)] xl:items-center">
+        {errorMessage ? (
+          <div className="rounded border border-rose-300/25 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
+            {errorMessage}
+          </div>
+        ) : null}
+
+        {cacheNotice ? (
+          <div className="rounded border border-cyan-300/25 bg-cyan-400/10 px-4 py-3 text-sm text-cyan-100">
+            {cacheNotice}
+          </div>
+        ) : null}
+
+        <section className="grid gap-2.5 border-y border-white/10 py-4 md:grid-cols-2 xl:grid-cols-[10.75rem_10.75rem_minmax(13rem,1fr)_18.75rem_10.5rem_11.5rem] xl:items-center">
           <label className="relative block min-w-0">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+            <input
+              type="date"
+              value={dateFrom}
+              onChange={(event) => {
+                setSelectedArchiveDate("LATEST");
+                setCacheNotice("");
+                setDateFrom(event.target.value);
+              }}
+              className={`${controlBase} px-3 font-medium`}
+              aria-label="開始日"
+            />
+          </label>
+          <label className="relative block min-w-0">
+            <input
+              type="date"
+              value={dateTo}
+              onChange={(event) => {
+                setSelectedArchiveDate("LATEST");
+                setCacheNotice("");
+                setDateTo(event.target.value);
+              }}
+              className={`${controlBase} px-3 font-medium`}
+              aria-label="終了日"
+            />
+          </label>
+          <label className="relative block min-w-0">
+            <Search className={controlIconClass} />
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="台湾、軍事、経済..."
-              className="h-10 w-full rounded border border-white/10 bg-white/[0.04] pl-10 pr-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-200/50"
+              className={`${controlBase} pl-10 pr-3 placeholder:text-slate-500`}
             />
           </label>
-          <div className="grid grid-cols-4 gap-2">
+          <div className="grid h-11 grid-cols-4 gap-1 rounded-md border border-white/10 bg-white/[0.035] p-1">
             {statusOrder.map((item) => (
               <button
                 key={item}
                 type="button"
                 onClick={() => setStatus(item)}
                 className={clsx(
-                  "inline-flex h-10 w-full items-center justify-center whitespace-nowrap rounded border px-1 text-[10px] font-semibold uppercase tracking-[0.08em] transition sm:px-2 sm:text-[11px] sm:tracking-[0.12em]",
+                  "inline-flex h-9 w-full items-center justify-center whitespace-nowrap rounded px-2 text-[10px] font-semibold uppercase tracking-[0.08em] transition sm:text-[11px]",
                   status === item
-                    ? "border-cyan-200/50 bg-cyan-300/15 text-cyan-50"
-                    : "border-white/10 bg-white/[0.03] text-slate-400 hover:text-slate-100"
+                    ? "bg-cyan-300/16 text-cyan-50 shadow-[inset_0_0_0_1px_rgba(165,243,252,0.28)]"
+                    : "text-slate-400 hover:bg-white/[0.04] hover:text-slate-100"
                 )}
               >
-                {getFilterLabel(item)}
+                {getFilterLabel(item, languagePair)}
               </button>
             ))}
           </div>
           <label className="relative block min-w-0">
-            <CalendarDays className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+            <CalendarDays className={controlIconClass} />
             <select
               value={selectedArchiveDate}
               onChange={(event) => loadArchiveDate(event.target.value)}
-              className="h-10 w-full min-w-0 appearance-none rounded border border-white/10 bg-white/[0.04] pl-10 pr-8 text-sm text-white outline-none transition focus:border-cyan-200/50"
+              className={`${controlBase} appearance-none pl-10 pr-8 font-semibold`}
             >
               <option value="LATEST" className="bg-slate-950">
                 最新
@@ -271,11 +457,11 @@ export default function Dashboard({ initialData }: Props) {
             </select>
           </label>
           <label className="relative block min-w-0">
-            <Filter className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+            <Filter className={controlIconClass} />
             <select
               value={category}
               onChange={(event) => setCategory(event.target.value)}
-              className="h-10 w-full min-w-0 appearance-none rounded border border-white/10 bg-white/[0.04] pl-10 pr-8 text-sm text-white outline-none transition focus:border-cyan-200/50"
+              className={`${controlBase} appearance-none pl-10 pr-8 font-semibold`}
             >
               {categories.map((item) => (
                 <option key={item} value={item} className="bg-slate-950">
@@ -289,7 +475,7 @@ export default function Dashboard({ initialData }: Props) {
         {status !== "ALL" ? (
           <section className="rounded border border-white/10 bg-white/[0.03] px-4 py-3">
             <div className="grid gap-3 sm:grid-cols-[7rem_minmax(0,1fr)] sm:items-start">
-              <FilterBadge status={status} />
+              <FilterBadge status={status} languagePair={languagePair} />
               <div className="min-w-0">
                 <h2 className="text-sm font-semibold text-white">{activeLens.title}</h2>
                 <p className="mt-1 text-sm leading-6 text-slate-400">{activeLens.description}</p>
@@ -299,29 +485,31 @@ export default function Dashboard({ initialData }: Props) {
         ) : null}
 
         {data.pairs.length === 0 ? (
-          <EmptyState isPending={isPending} onRefresh={refresh} />
+          <EmptyState isPending={isPending} onRefresh={() => refresh()} />
         ) : filteredPairs.length === 0 ? (
           <NoFilteredResults />
         ) : (
           <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
             <ArticleColumn
-              title="中国語版新着"
-              source="CN"
-              rows={cnRows}
+              title={`基準言語 ${languagePair.base.code}`}
+              role="base"
+              languagePair={languagePair}
+              rows={baseRows}
               selectedId={selected?.id}
               onSelect={setSelectedId}
             />
             <ArticleColumn
-              title="日本語版新着"
-              source="JP"
-              rows={jpRows}
+              title={`対象言語 ${languagePair.target.code}`}
+              role="target"
+              languagePair={languagePair}
+              rows={targetRows}
               selectedId={selected?.id}
               onSelect={setSelectedId}
             />
           </div>
         )}
 
-        {selected ? <ComparisonPanel pair={selected} /> : null}
+        {selected ? <ComparisonPanel pair={selected} languagePair={languagePair} /> : null}
       </div>
     </main>
   );
@@ -349,12 +537,30 @@ function Metric({
   );
 }
 
-function FilterBadge({ status }: { status: Exclude<StatusFilter, "ALL"> }) {
-  return <StatusBadge status={status} className="h-7 w-28 justify-center" />;
+function FilterBadge({
+  status,
+  languagePair
+}: {
+  status: Exclude<StatusFilter, "ALL">;
+  languagePair: LanguagePairConfig;
+}) {
+  return (
+    <StatusBadge
+      status={getBadgeStatus(status, languagePair)}
+      label={getFilterBadgeLabel(status, languagePair)}
+      className="h-7 w-28 justify-center"
+    />
+  );
 }
 
-function DifferenceMarkers({ pair }: { pair: ArticlePair }) {
-  const kinds = getDifferenceKinds(pair);
+function DifferenceMarkers({
+  pair,
+  languagePair
+}: {
+  pair: ArticlePair;
+  languagePair: LanguagePairConfig;
+}) {
+  const kinds = getDifferenceKinds(pair, languagePair);
   if (!kinds.length) return null;
 
   return (
@@ -378,13 +584,15 @@ function DifferenceMarkers({ pair }: { pair: ArticlePair }) {
 
 function ArticleColumn({
   title,
-  source,
+  role,
+  languagePair,
   rows,
   selectedId,
   onSelect
 }: {
   title: string;
-  source: Source;
+  role: LanguageRole;
+  languagePair: LanguagePairConfig;
   rows: ArticlePair[];
   selectedId?: string;
   onSelect: (id: string) => void;
@@ -398,19 +606,26 @@ function ArticleColumn({
         <span className="text-xs text-slate-500">{rows.length} nodes</span>
       </div>
       <div className="grid max-h-[720px] gap-3 overflow-y-auto pr-1 scrollbar-thin">
-        {rows.map((pair) => {
-          const article = source === "CN" ? pair.cn : pair.jp;
-          if (!article) return null;
-          return (
-            <ArticleCard
-              key={`${source}-${pair.id}`}
-              article={article}
-              pair={pair}
-              selected={selectedId === pair.id}
-              onSelect={() => onSelect(pair.id)}
-            />
-          );
-        })}
+        {rows.length ? (
+          rows.map((pair) => {
+            const article = getRoleArticle(pair, role, languagePair);
+            if (!article) return null;
+            return (
+              <ArticleCard
+                key={`${role}-${pair.id}`}
+                article={article}
+                pair={pair}
+                languagePair={languagePair}
+                selected={selectedId === pair.id}
+                onSelect={() => onSelect(pair.id)}
+              />
+            );
+          })
+        ) : (
+          <div className="rounded border border-dashed border-white/10 bg-white/[0.025] p-5 text-sm leading-6 text-slate-500">
+            この条件に合う観測ノードはありません。
+          </div>
+        )}
       </div>
     </section>
   );
@@ -419,14 +634,19 @@ function ArticleColumn({
 function ArticleCard({
   article,
   pair,
+  languagePair,
   selected,
   onSelect
 }: {
   article: Article;
   pair: ArticlePair;
+  languagePair: LanguagePairConfig;
   selected: boolean;
   onSelect: () => void;
 }) {
+  const displayStatus = getDisplayStatus(pair, languagePair);
+  const showGeneratedMeta = shouldShowGeneratedMeta(pair, languagePair);
+
   return (
     <button
       type="button"
@@ -439,8 +659,8 @@ function ArticleCard({
       )}
     >
       <div className="mb-3 flex flex-wrap items-center gap-2">
-        <StatusBadge status={getPrimaryStatus(pair)} />
-        <DifferenceMarkers pair={pair} />
+        <StatusBadge status={displayStatus.status} label={displayStatus.label} />
+        <DifferenceMarkers pair={pair} languagePair={languagePair} />
         <span className="rounded border border-white/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">
           {article.category || "uncategorized"}
         </span>
@@ -448,12 +668,14 @@ function ArticleCard({
       <h3 className="line-clamp-3 text-base font-semibold leading-6 text-white">
         {article.title}
       </h3>
-      {article.translatedTitle && article.translatedTitle !== article.title ? (
+      {showGeneratedMeta && article.translatedTitle && article.translatedTitle !== article.title ? (
         <p className="mt-2 line-clamp-2 text-sm leading-5 text-cyan-100/80">
           {article.translatedTitle}
         </p>
       ) : null}
-      <p className="mt-3 line-clamp-3 text-sm leading-6 text-slate-400">{article.summary}</p>
+      {shouldShowSummary(article, showGeneratedMeta) ? (
+        <p className="mt-3 line-clamp-3 text-sm leading-6 text-slate-400">{article.summary}</p>
+      ) : null}
       <div className="mt-4 flex items-center justify-between gap-3">
         <span className="text-[11px] text-slate-500">
           {article.publishedAt || article.urlDate || "time n/a"}
@@ -465,18 +687,33 @@ function ArticleCard({
   );
 }
 
-function ComparisonPanel({ pair }: { pair: ArticlePair }) {
+function ComparisonPanel({
+  pair,
+  languagePair
+}: {
+  pair: ArticlePair;
+  languagePair: LanguagePairConfig;
+}) {
   const analysis = pair.analysis;
   const terms = pair.highlights.slice(0, 10);
+  const baseArticle = getRoleArticle(pair, "base", languagePair);
+  const targetArticle = getRoleArticle(pair, "target", languagePair);
+  const displayStatus = getDisplayStatus(pair, languagePair);
+  const canShowAnalysis = Boolean(baseArticle && targetArticle && analysis);
+  const showGeneratedMeta = shouldShowGeneratedMeta(pair, languagePair);
 
   return (
     <section className="rounded border border-white/10 bg-slate-950/70 shadow-glow">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-4 sm:px-5">
         <div>
           <div className="mb-2 flex flex-wrap items-center gap-2">
-            <StatusBadge status={getPrimaryStatus(pair)} />
-            <DifferenceMarkers pair={pair} />
-            <span className="text-xs text-slate-500">match {Math.round(pair.matchScore * 100)}%</span>
+            <StatusBadge status={displayStatus.status} label={displayStatus.label} />
+            <DifferenceMarkers pair={pair} languagePair={languagePair} />
+            <span className="text-xs text-slate-500">
+              {baseArticle && targetArticle
+                ? `match ${Math.round(pair.matchScore * 100)}%`
+                : "single-sided"}
+            </span>
           </div>
           <h2 className="text-lg font-semibold text-white">比較パネル</h2>
         </div>
@@ -493,15 +730,27 @@ function ComparisonPanel({ pair }: { pair: ArticlePair }) {
       </div>
 
       <div className="grid gap-0 lg:grid-cols-2">
-        <ArticlePane label="CN" article={pair.cn} terms={terms} />
-        <ArticlePane label="JP" article={pair.jp} terms={terms} />
+        <ArticlePane
+          role="base"
+          language={languagePair.base}
+          article={baseArticle}
+          terms={terms}
+          showGeneratedMeta={showGeneratedMeta}
+        />
+        <ArticlePane
+          role="target"
+          language={languagePair.target}
+          article={targetArticle}
+          terms={terms}
+          showGeneratedMeta={showGeneratedMeta}
+        />
       </div>
 
       <div className="border-t border-white/10 p-4 sm:p-5">
-        {analysis ? (
+        {canShowAnalysis && analysis ? (
           <div className="grid gap-4 lg:grid-cols-3">
-            <AnalysisList title="中国語版の要点" items={analysis.cnPoints} />
-            <AnalysisList title="日本語版の要点" items={analysis.jpPoints} />
+            <AnalysisList title={`基準言語の要点 (${languagePair.base.code})`} items={analysis.cnPoints} />
+            <AnalysisList title={`対象言語の要点 (${languagePair.target.code})`} items={analysis.jpPoints} />
             <div className="grid gap-3">
               <SignalBlock
                 title="消えている論点"
@@ -530,8 +779,15 @@ function ComparisonPanel({ pair }: { pair: ArticlePair }) {
           </div>
         ) : (
           <div className="grid gap-3 md:grid-cols-3">
-            <NarrativeTile label={statusCopy[getPrimaryStatus(pair)]} value="このペアは未分析または片側のみの記事です。" />
-            <NarrativeTile label="接続性" value={pair.cn && pair.jp ? "本文比較の候補です。" : "片側掲載として観測されています。"} />
+            <NarrativeTile label={displayStatus.copy} value="このペアは未分析または片側のみの記事です。" />
+            <NarrativeTile
+              label="接続性"
+              value={
+                baseArticle && targetArticle
+                  ? "本文比較の候補です。"
+                  : "片側掲載または未接続の対象言語として観測されています。"
+              }
+            />
             <NarrativeTile label="キーワード" value={terms.join(" / ") || "n/a"} />
           </div>
         )}
@@ -541,18 +797,28 @@ function ComparisonPanel({ pair }: { pair: ArticlePair }) {
 }
 
 function ArticlePane({
-  label,
+  role,
+  language,
   article,
-  terms
+  terms,
+  showGeneratedMeta
 }: {
-  label: Source;
+  role: LanguageRole;
+  language: LanguageOption;
   article?: Article;
   terms: string[];
+  showGeneratedMeta: boolean;
 }) {
+  const roleLabel = role === "base" ? "BASE" : "TARGET";
+  const label = `${roleLabel} / ${language.code}`;
+
   if (!article) {
     return (
       <div className="min-h-80 border-white/10 p-4 sm:p-5 lg:border-l">
-        <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+        <span
+          className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500"
+          title={language.name}
+        >
           {label}
         </span>
         <div className="mt-12 rounded border border-dashed border-white/10 p-6 text-center text-sm text-slate-500">
@@ -565,7 +831,10 @@ function ArticlePane({
   return (
     <div className="min-w-0 border-white/10 p-4 sm:p-5 lg:border-l first:lg:border-l-0">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+        <span
+          className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500"
+          title={language.name}
+        >
           {label}
         </span>
         <a
@@ -578,10 +847,12 @@ function ArticlePane({
         </a>
       </div>
       <h3 className="text-lg font-semibold leading-7 text-white">{article.title}</h3>
-      {article.translatedTitle && article.translatedTitle !== article.title ? (
+      {showGeneratedMeta && article.translatedTitle && article.translatedTitle !== article.title ? (
         <p className="mt-2 text-sm leading-6 text-cyan-100/80">{article.translatedTitle}</p>
       ) : null}
-      <p className="mt-3 text-sm leading-6 text-slate-400">{article.summary}</p>
+      {shouldShowSummary(article, showGeneratedMeta) ? (
+        <p className="mt-3 text-sm leading-6 text-slate-400">{article.summary}</p>
+      ) : null}
       <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-500">
         {article.urlDate ? <span>URL {article.urlDate}</span> : null}
         {article.publishedDate ? <span>BODY {article.publishedDate}</span> : null}
@@ -600,7 +871,7 @@ function AnalysisList({ title, items }: { title: string; items: string[] }) {
       <h3 className="text-sm font-semibold text-white">{title}</h3>
       <ul className="mt-3 space-y-2 text-sm leading-6 text-slate-300">
         {items.map((item) => (
-          <li key={item}>{item}</li>
+          <li key={item}>{normalizeAnalysisText(item)}</li>
         ))}
       </ul>
     </div>
@@ -633,7 +904,7 @@ function SignalBlock({
               className={clsx("diff-row", tone === "minus" ? "diff-row-minus" : "diff-row-plus")}
             >
               <span className="diff-prefix">{marker}</span>
-              <span>{item}</span>
+              <span>{normalizeAnalysisText(item)}</span>
             </div>
           ))
         ) : (
@@ -653,7 +924,7 @@ function NarrativeTile({ label, value }: { label: string; value: string }) {
       <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">
         {label}
       </div>
-      <p className="mt-2 text-sm leading-6 text-slate-200">{value}</p>
+      <p className="mt-2 text-sm leading-6 text-slate-200">{normalizeAnalysisText(value)}</p>
     </div>
   );
 }
@@ -673,7 +944,7 @@ function EmptyState({
         </div>
         <h2 className="text-xl font-semibold text-white">No snapshot</h2>
         <p className="mt-2 text-sm leading-6 text-slate-400">
-          中国語版と日本語版のライブ取得待ちです。
+          基準言語版と対象言語版のライブ取得待ちです。
         </p>
         <button
           type="button"
@@ -731,8 +1002,134 @@ function highlightText(text: string, terms: string[]) {
   });
 }
 
+function normalizeAnalysisText(input: string) {
+  return input
+    .replace(/“([^”]+)”/g, "「$1」")
+    .replace(/"([^"]+)"/g, "「$1」")
+    .replace(/（CN）|\(CN\)/g, "（中国語版）")
+    .replace(/（JP）|\(JP\)/g, "（対象言語版）")
+    .replace(/具体提及/g, "具体的に言及")
+    .replace(/未提及/g, "言及していない")
+    .replace(/中国强调/g, "中国語版は")
+    .replace(/日本强调/g, "対象言語版は")
+    .replace(/军演/g, "軍事演習")
+    .replace(/细节/g, "詳細")
+    .replace(/威胁/g, "脅威")
+    .replace(/首次/g, "初使用")
+    .replace(/具体时间/g, "具体的な時点")
+    .replace(/导弹/g, "導弾")
+    .replace(/再军事化/g, "再軍事化")
+    .replace(/加速/g, "加速")
+    .replace(/肩并肩/g, "肩を並べて")
+    .replace(/新型军国主义/g, "新型軍国主義");
+}
+
 function escapeRegExp(input: string) {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function parseSnapshotResponse(response: Response): Promise<RefreshResult> {
+  const contentType = response.headers.get("content-type") ?? "";
+  const payload = contentType.includes("application/json")
+    ? await response.json().catch(() => undefined)
+    : await response.text().catch(() => "");
+
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(payload) || `${response.status} ${response.statusText}`);
+  }
+
+  if (!payload || typeof payload !== "object") {
+    throw new Error("APIレスポンスを読み取れませんでした。");
+  }
+
+  return payload as RefreshResult;
+}
+
+function apiErrorMessage(payload: unknown) {
+  if (typeof payload === "string") return payload;
+  if (!payload || typeof payload !== "object") return "";
+  const value = (payload as { error?: unknown; message?: unknown }).error ??
+    (payload as { message?: unknown }).message;
+  return typeof value === "string" ? value : "";
+}
+
+function readableError(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function rememberClientSnapshot(cache: Map<string, RefreshResult>, snapshot: RefreshResult) {
+  const sourceLanguage = snapshot.baseLanguage ?? "CN";
+  const targetLanguage = snapshot.targetLanguage ?? "JP";
+  const dates = snapshotDates(snapshot);
+
+  if (!snapshot.activeDate) {
+    cache.set(latestSnapshotKey(sourceLanguage, targetLanguage), snapshot);
+  }
+
+  if (snapshot.activeDate && isArchiveDate(snapshot.activeDate)) {
+    cache.set(datedSnapshotKey(sourceLanguage, targetLanguage, snapshot.activeDate), snapshot);
+  }
+
+  if (dates.length) {
+    cache.set(rangeSnapshotKey(sourceLanguage, targetLanguage, dates), snapshot);
+    if (dates.length === 1) {
+      cache.set(datedSnapshotKey(sourceLanguage, targetLanguage, dates[0]), snapshot);
+    }
+  }
+}
+
+function findClientSnapshot(
+  cache: Map<string, RefreshResult>,
+  options: {
+    sourceLanguage: Source;
+    targetLanguage: Source;
+    archiveDate: string;
+    dates: string[];
+  }
+) {
+  const dates = normalizeDateList(options.dates);
+  const keys =
+    options.archiveDate !== "LATEST"
+      ? [
+          datedSnapshotKey(options.sourceLanguage, options.targetLanguage, options.archiveDate),
+          dates.length ? rangeSnapshotKey(options.sourceLanguage, options.targetLanguage, dates) : "",
+          latestSnapshotKey(options.sourceLanguage, options.targetLanguage)
+        ]
+      : [
+          dates.length ? rangeSnapshotKey(options.sourceLanguage, options.targetLanguage, dates) : "",
+          latestSnapshotKey(options.sourceLanguage, options.targetLanguage)
+        ];
+
+  for (const key of keys) {
+    const snapshot = key ? cache.get(key) : undefined;
+    if (snapshot) return snapshot;
+  }
+
+  return undefined;
+}
+
+function snapshotDates(snapshot: RefreshResult) {
+  return normalizeDateList(
+    snapshot.targetDateScope?.length ? snapshot.targetDateScope : snapshot.dateScope
+  );
+}
+
+function snapshotScopeLabel(snapshot: RefreshResult, archiveDate: string) {
+  if (archiveDate !== "LATEST") return archiveDate;
+  const dates = snapshotDates(snapshot);
+  return dates.length ? formatScopeRange(dates) : "LATEST";
+}
+
+function latestSnapshotKey(sourceLanguage: Source, targetLanguage: Source) {
+  return `latest:${sourceLanguage}:${targetLanguage}`;
+}
+
+function datedSnapshotKey(sourceLanguage: Source, targetLanguage: Source, date: string) {
+  return `date:${sourceLanguage}:${targetLanguage}:${date}`;
+}
+
+function rangeSnapshotKey(sourceLanguage: Source, targetLanguage: Source, dates: string[]) {
+  return `range:${sourceLanguage}:${targetLanguage}:${normalizeDateList(dates).join(",")}`;
 }
 
 function isArchiveDate(input: string) {
@@ -750,36 +1147,259 @@ function formatDate(input: string) {
   }
 }
 
-function recentDateScope() {
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(today.getDate() - 1);
-  return [toLocalDate(today), toLocalDate(yesterday)];
+function dateRangeFromScope(scope?: string[]) {
+  const dates = normalizeDateList(scope);
+  if (!dates.length) {
+    const today = toLocalDate(new Date());
+    return {
+      from: today,
+      to: today
+    };
+  }
+  return {
+    from: dates[dates.length - 1],
+    to: dates[0]
+  };
 }
 
-function matchesStatusFilter(pair: ArticlePair, status: StatusFilter) {
+function dateScopeFromRange(fromInput: string, toInput: string) {
+  const from = normalizeDateInput(fromInput);
+  const to = normalizeDateInput(toInput);
+  if (!from || !to) return [];
+
+  const start = from <= to ? from : to;
+  const end = from <= to ? to : from;
+  const dates: string[] = [];
+  let cursor = start;
+  while (cursor <= end && dates.length < 31) {
+    dates.push(cursor);
+    cursor = addDays(cursor, 1);
+  }
+  return dates.sort((a, b) => b.localeCompare(a));
+}
+
+function normalizeDateList(scope?: string[]) {
+  return [...new Set((scope ?? []).map(normalizeDateInput).filter((date): date is string => Boolean(date)))]
+    .sort((a, b) => b.localeCompare(a));
+}
+
+function normalizeDateInput(input?: string) {
+  const match = input?.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!match) return undefined;
+  const normalized = `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
+  return isRealDate(normalized) ? normalized : undefined;
+}
+
+function addDays(date: string, offset: number) {
+  const value = new Date(`${date}T00:00:00.000Z`);
+  value.setUTCDate(value.getUTCDate() + offset);
+  return value.toISOString().slice(0, 10);
+}
+
+function isRealDate(input: string) {
+  const [year, month, day] = input.split("-").map(Number);
+  if (!year || !month || !day) return false;
+  const value = new Date(Date.UTC(year, month - 1, day));
+  return value.toISOString().slice(0, 10) === input;
+}
+
+function formatScopeRange(scope?: string[]) {
+  const range = dateRangeFromScope(scope);
+  return range.from === range.to ? range.to : `${range.from} - ${range.to}`;
+}
+
+function getLanguageOptions(data: RefreshResult): LanguageOption[] {
+  const values = data.availableLanguages?.length
+    ? data.availableLanguages
+    : [
+        {
+          code: "CN" as Source,
+          label: "Chinese",
+          nativeName: "中文",
+          editionLabel: "中国語版",
+          group: "base" as const,
+          enabled: true
+        },
+        {
+          code: "JP" as Source,
+          label: "Japanese",
+          nativeName: "日本語",
+          editionLabel: "日本語版",
+          group: "foreign" as const,
+          enabled: true
+        }
+      ];
+
+  return values.map((language) => ({
+    code: language.code,
+    source: language.code,
+    name: language.label,
+    nativeName: language.nativeName,
+    editionLabel: language.editionLabel,
+    group: language.group,
+    enabled: language.enabled
+  }));
+}
+
+function makeLanguagePair(
+  languages: LanguageOption[],
+  baseLanguage: Source,
+  targetLanguage: Source
+): LanguagePairConfig {
+  const fallbackBase = languages.find((language) => language.source === "CN") ?? languages[0];
+  const base =
+    languages.find((language) => language.source === baseLanguage) ?? fallbackBase;
+  const target =
+    languages.find((language) => language.source === targetLanguage) ??
+    languages.find((language) => language.source === "JP") ??
+    languages.find((language) => language.source !== base.source) ??
+    base;
+
+  return {
+    id: `${base.source}-${target.source}`,
+    base,
+    target
+  };
+}
+
+function getSourceCount(data: RefreshResult, source?: Source) {
+  if (!source) return 0;
+  const direct = data.stats.countsBySource?.[source];
+  if (typeof direct === "number") return direct;
+  if (source === data.baseLanguage && typeof data.stats.baseCount === "number") {
+    return data.stats.baseCount;
+  }
+  if (source === data.targetLanguage && typeof data.stats.targetCount === "number") {
+    return data.stats.targetCount;
+  }
+  if (source === data.baseLanguage && data.baseArticles) return data.baseArticles.length;
+  if (source === data.targetLanguage && data.targetArticles) return data.targetArticles.length;
+  if (source === (data.baseLanguage ?? "CN")) return data.stats.cnCount;
+  if (source === (data.targetLanguage ?? "JP")) return data.stats.jpCount;
+  if (source === "CN") return data.stats.cnCount;
+  return 0;
+}
+
+function getRoleArticle(
+  pair: ArticlePair,
+  role: LanguageRole,
+  languagePair: LanguagePairConfig
+) {
+  const source = role === "base" ? languagePair.base.source : languagePair.target.source;
+  if (!source) return undefined;
+  return getSourceArticle(pair, source);
+}
+
+function getSourceArticle(pair: ArticlePair, source: Source) {
+  return (
+    pair.articlesBySource?.[source] ??
+    (pair.base?.source === source ? pair.base : undefined) ??
+    (pair.target?.source === source ? pair.target : undefined) ??
+    (pair.cn?.source === source ? pair.cn : undefined) ??
+    (pair.jp?.source === source ? pair.jp : undefined)
+  );
+}
+
+function hasMatchedArticles(pair: ArticlePair, languagePair: LanguagePairConfig) {
+  return Boolean(
+    getRoleArticle(pair, "base", languagePair) &&
+      getRoleArticle(pair, "target", languagePair)
+  );
+}
+
+function shouldShowGeneratedMeta(pair: ArticlePair, languagePair: LanguagePairConfig) {
+  return languagePair.target.source === "JP" || hasMatchedArticles(pair, languagePair);
+}
+
+function shouldShowSummary(article: Article, showGeneratedMeta: boolean) {
+  return showGeneratedMeta || !hasGeneratedTranslation(article);
+}
+
+function hasGeneratedTranslation(article: Article) {
+  return Boolean(article.translatedTitle && article.translatedTitle !== article.title);
+}
+
+function matchesStatusFilter(
+  pair: ArticlePair,
+  status: StatusFilter,
+  languagePair: LanguagePairConfig
+) {
   if (status === "ALL") return true;
-  if (status === "MATCHED") return Boolean(pair.cn && pair.jp);
-  return pair.status === status;
+  const hasBase = Boolean(getRoleArticle(pair, "base", languagePair));
+  const hasTarget = Boolean(getRoleArticle(pair, "target", languagePair));
+  if (status === "MATCHED") return hasBase && hasTarget;
+  if (status === "BASE_ONLY") return hasBase && !hasTarget;
+  return !hasBase && hasTarget;
 }
 
-function getFilterLabel(status: StatusFilter) {
+function getFilterLabel(status: StatusFilter, languagePair: LanguagePairConfig) {
   switch (status) {
-    case "CN ONLY":
-      return "CN";
-    case "JP ONLY":
-      return "JP";
+    case "BASE_ONLY":
+      return languagePair.base.code;
+    case "TARGET_ONLY":
+      return languagePair.target.code;
     default:
       return status;
   }
 }
 
-function getPrimaryStatus(pair: ArticlePair): PairStatus {
-  return pair.cn && pair.jp ? "MATCHED" : pair.status;
+function getFilterBadgeLabel(
+  status: Exclude<StatusFilter, "ALL">,
+  languagePair: LanguagePairConfig
+) {
+  if (status === "BASE_ONLY") return `${languagePair.base.code} ONLY`;
+  if (status === "TARGET_ONLY") return `${languagePair.target.code} ONLY`;
+  return "MATCHED";
 }
 
-function getDifferenceKinds(pair: ArticlePair) {
-  if (!pair.cn || !pair.jp) return [];
+function getBadgeStatus(
+  status: Exclude<StatusFilter, "ALL">,
+  languagePair: LanguagePairConfig
+): PairStatus {
+  if (status === "MATCHED") return "MATCHED";
+  if (status === "BASE_ONLY") return "CN ONLY";
+  return languagePair.target.source === "JP" ? "JP ONLY" : "TARGET ONLY";
+}
+
+function getDisplayStatus(pair: ArticlePair, languagePair: LanguagePairConfig) {
+  const hasBase = Boolean(getRoleArticle(pair, "base", languagePair));
+  const hasTarget = Boolean(getRoleArticle(pair, "target", languagePair));
+
+  if (hasBase && hasTarget) {
+    return {
+      status: "MATCHED" as PairStatus,
+      label: "MATCHED",
+      copy: "対応あり"
+    };
+  }
+
+  if (hasBase) {
+    return {
+      status: getBadgeStatus("BASE_ONLY", languagePair),
+      label: `${languagePair.base.code} ONLY`,
+      copy: "基準言語のみ"
+    };
+  }
+
+  if (hasTarget) {
+    return {
+      status: getBadgeStatus("TARGET_ONLY", languagePair),
+      label: `${languagePair.target.code} ONLY`,
+      copy: "対象言語のみ"
+    };
+  }
+
+  return {
+    status: pair.status,
+    label: pair.status,
+    copy: "未接続"
+  };
+}
+
+function getDifferenceKinds(pair: ArticlePair, languagePair: LanguagePairConfig) {
+  const baseArticle = getRoleArticle(pair, "base", languagePair);
+  const targetArticle = getRoleArticle(pair, "target", languagePair);
+  if (!baseArticle || !targetArticle) return [];
 
   const analysis = pair.analysis;
   const bodyScore = analysis?.bodyDifferenceScore ?? 0;
@@ -791,7 +1411,7 @@ function getDifferenceKinds(pair: ArticlePair) {
     pair.status === "BODY DIFFERENCE" ||
     bodyScore >= 35 ||
     hasPointDiff ||
-    Math.abs(pair.cn.body.length - pair.jp.body.length) > 1800;
+    Math.abs(baseArticle.body.length - targetArticle.body.length) > 1800;
   const hasFramingDiff = pair.status === "FRAMING SHIFT" || framingScore >= 55;
 
   return [
@@ -800,25 +1420,25 @@ function getDifferenceKinds(pair: ArticlePair) {
   ];
 }
 
-function getLensCopy(status: StatusFilter) {
+function getLensCopy(status: StatusFilter, languagePair: LanguagePairConfig) {
   switch (status) {
-    case "CN ONLY":
+    case "BASE_ONLY":
       return {
-        title: "中国語版にのみ存在する記事",
+        title: "基準言語にのみ存在する記事",
         description:
-          "中国語版には出ているが、日本語版では対応記事が見つからない記事です。対外向けに出さない話題の候補として見ます。"
+          `${languagePair.base.code} には出ているが、${languagePair.target.code} では対応記事が見つからない記事です。対象言語へ出さない話題の候補として見ます。`
       };
-    case "JP ONLY":
+    case "TARGET_ONLY":
       return {
-        title: "日本語版にのみ存在する記事",
+        title: "対象言語にのみ存在する記事",
         description:
-          "日本語版には出ているが、中国語版トップ/日別取得範囲で対応記事が見つからない記事です。日本向けに選ばれた話題の候補として見ます。"
+          `${languagePair.target.code} には出ているが、${languagePair.base.code} の取得範囲で対応記事が見つからない記事です。対象言語向けに選ばれた話題の候補として見ます。`
       };
     case "MATCHED":
       return {
         title: "同じ話題として対応した記事",
         description:
-          "本文差分や論調差分の有無に関係なく、中国語版と日本語版が同じ話題を扱っている記事ペアです。差分がある場合はカード上に BODY DIFF / FRAMING が追加表示されます。"
+          "本文差分や論調差分の有無に関係なく、基準言語版と対象言語版が同じ話題を扱っている記事ペアです。差分がある場合はカード上に BODY DIFF / FRAMING が追加表示されます。"
       };
     default:
       return {

@@ -1,13 +1,12 @@
 import * as cheerio from "cheerio";
 import iconv from "iconv-lite";
 import type { Article, Source } from "./types";
+import { getPeopleLanguageConfig, PEOPLE_LANGUAGE_CODES } from "./languages";
 import { cleanText, compactSummary, extractKeywords, stableId, truncate } from "./text";
 
-const CN_HOME = "https://www.people.com.cn/";
-const JP_HOME = "http://j.people.com.cn/";
-const JP_ALL_ARTICLES = "http://j.people.com.cn/94765/index.html";
 const USER_AGENT =
   "PeopleDiff/0.1 (+https://vercel.app; research dashboard; contact: local-poc)";
+const ARTICLE_CACHE_LIMIT = 2500;
 
 type Candidate = {
   title: string;
@@ -26,23 +25,54 @@ type ScrapeOptions = {
   maxArticles?: number;
 };
 
+type PeopleSearchOptions = {
+  dates?: string[];
+  maxQueries?: number;
+  maxResultsPerQuery?: number;
+  maxArticles?: number;
+};
+
+type PeopleSearchRecord = {
+  title?: string;
+  url?: string;
+  displayTime?: number;
+  inputTime?: number;
+  belongsName?: string;
+};
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __PEOPLEDIFF_ARTICLE_CACHE__: Map<string, Article> | undefined;
+}
+
 export async function scrapePeople(source: Source, options: ScrapeOptions = {}) {
+  return (await scrapePeopleDetailed(source, options)).articles;
+}
+
+export async function scrapePeopleDetailed(source: Source, options: ScrapeOptions = {}) {
+  const language = getPeopleLanguageConfig(source);
   const limit = options.limit ?? 10;
   const dateScope = normalizeDateScope(options.dates);
-  const candidates = dateScope.length
+  const dailyCollection = dateScope.length
     ? await collectDailyCandidates(source, dateScope, {
-        maxPages: options.maxPages ?? (source === "CN" ? 5 : 8)
+        maxPages: options.maxPages ?? language.defaultDailyMaxPages
       })
-    : await collectHomeCandidates(source, limit);
-  const selectedCandidates = candidates.slice(
-    0,
-    dateScope.length ? (options.maxArticles ?? 160) : limit
-  );
+    : undefined;
+  const warnings = [...(dailyCollection?.warnings ?? [])];
+  if (dailyCollection && dailyCollection.attemptedPages > 0 && dailyCollection.successfulPages === 0) {
+    throw new Error(
+      `${language.warningLabel}の一覧ページを取得できませんでした: ${warnings.slice(0, 3).join(" / ")}`
+    );
+  }
+  const candidates = dailyCollection?.candidates ?? (await collectHomeCandidates(source, limit));
+  const selectedCandidates = dateScope.length
+    ? selectDailyCandidates(candidates, dateScope, options.maxArticles ?? 160)
+    : candidates.slice(0, limit);
   const articles: Article[] = [];
   const seen = new Set<string>();
   const seenTitles = new Set<string>();
 
-  const scraped = await mapWithConcurrency(selectedCandidates, 8, async (candidate) => {
+  const scraped = await mapWithConcurrency(selectedCandidates, scrapeConcurrency(), async (candidate) => {
     const titleKey = cleanTitle(candidate.title);
     if (seen.has(candidate.url) || seenTitles.has(titleKey)) return undefined;
     seen.add(candidate.url);
@@ -60,6 +90,7 @@ export async function scrapePeople(source: Source, options: ScrapeOptions = {}) 
       }
     } catch {
       seenTitles.add(titleKey);
+      warnings.push(`${language.warningLabel}本文取得失敗: ${candidate.title}`);
       return {
         id: stableId(candidate.url),
         source,
@@ -82,10 +113,67 @@ export async function scrapePeople(source: Source, options: ScrapeOptions = {}) 
     if (article) articles.push(article);
   }
 
-  return articles;
+  return { articles, warnings: trimWarnings(warnings) };
+}
+
+export async function searchPeopleChineseArticlesForTargets(
+  targetArticles: Article[],
+  options: PeopleSearchOptions = {}
+) {
+  const dateScope = normalizeDateScope(options.dates);
+  const queries = [
+    ...new Set(targetArticles.flatMap((article) => buildPeopleSearchQueries(article)))
+  ].slice(0, options.maxQueries ?? 24);
+  const warnings: string[] = [];
+  if (!queries.length) return { articles: [] as Article[], warnings };
+
+  const searched = await mapWithConcurrency(queries, 4, async (query) => {
+    try {
+      return await queryPeopleSearch(query, options.maxResultsPerQuery ?? 5);
+    } catch (error) {
+      warnings.push(`人民網検索取得失敗: ${query} (${errorMessage(error)})`);
+      return [] as Candidate[];
+    }
+  });
+  const candidates = searched
+    .flat()
+    .filter((candidate): candidate is Candidate => Boolean(candidate))
+    .filter((candidate) => {
+      const date = candidate.urlDate || candidate.listDate;
+      return !dateScope.length || dateScope.includes(date ?? "");
+    })
+    .filter((candidate, index, all) => all.findIndex((item) => item.url === candidate.url) === index)
+    .slice(0, options.maxArticles ?? 60);
+
+  const scraped = await mapWithConcurrency(candidates, scrapeConcurrency(), async (candidate) => {
+    try {
+      return await scrapeArticle(candidate, "CN");
+    } catch {
+      warnings.push(`中国語版検索候補の本文取得失敗: ${candidate.title}`);
+      return undefined;
+    }
+  });
+
+  return {
+    articles: scraped.filter((article): article is Article => Boolean(article)),
+    warnings: trimWarnings(warnings)
+  };
 }
 
 async function scrapeArticle(candidate: Candidate, source: Source): Promise<Article> {
+  const cached = cachedArticle(source, candidate.url);
+  if (cached) {
+    return {
+      ...cached,
+      urlDate: cached.urlDate || candidate.urlDate,
+      publishedAt: cached.publishedAt || candidate.listPublishedAt,
+      publishedDate: cached.publishedDate || candidate.listDate,
+      discoveredFrom: cached.discoveredFrom || candidate.discoveredFrom,
+      category: cached.category || candidate.category
+    };
+  }
+
+  const language = getPeopleLanguageConfig(source);
   const html = await fetchDecodedHtml(candidate.url);
   const $ = cheerio.load(html);
 
@@ -106,7 +194,7 @@ async function scrapeArticle(candidate: Candidate, source: Source): Promise<Arti
   const publishedDate = normalizePublishedDate(publishedAt);
   const sourceText = [title, category, body].filter(Boolean).join("\n");
 
-  return {
+  return rememberArticle({
     id: stableId(candidate.url),
     source,
     title,
@@ -118,13 +206,13 @@ async function scrapeArticle(candidate: Candidate, source: Source): Promise<Arti
     discoveredFrom: candidate.discoveredFrom,
     category,
     body: truncate(body, 8000),
-    summary: compactSummary(body, source === "CN" ? 160 : 180),
+    summary: compactSummary(body, language.summaryLength),
     keywords: extractKeywords(sourceText)
-  };
+  });
 }
 
 async function collectHomeCandidates(source: Source, limit: number) {
-  const homeUrl = source === "CN" ? CN_HOME : JP_HOME;
+  const homeUrl = getPeopleLanguageConfig(source).homeUrl;
   const html = await fetchDecodedHtml(homeUrl);
   const $ = cheerio.load(html);
   return collectCandidates($, homeUrl, source, homeUrl).slice(0, Math.max(limit * 2, limit));
@@ -136,41 +224,124 @@ async function collectDailyCandidates(
   options: { maxPages: number }
 ) {
   const candidates = new Map<string, Candidate>();
-  const pages =
+  const warnings: string[] = [];
+  let attemptedPages = 0;
+  let successfulPages = 0;
+  const language = getPeopleLanguageConfig(source);
+  const initialPages =
     source === "CN"
       ? cnDailySourcePages(options.maxPages)
-      : jpDailySourcePages(options.maxPages);
+      : targetDailySourcePages(source, options.maxPages);
+  const pages = [...initialPages];
+  const queuedPages = new Set(pages);
   const earliest = dateScope.slice().sort()[0];
+  const stoppedPageBases = new Set<string>();
+  const stalePageCounts = new Map<string, number>();
 
-  for (const pageUrl of pages) {
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+    const pageUrl = pages[pageIndex];
+    const pageInfo = paginatedPageInfo(pageUrl);
+    if (stoppedPageBases.has(pageInfo.baseUrl)) continue;
+
+    attemptedPages += 1;
     try {
       const html = await fetchDecodedHtml(pageUrl);
       const $ = cheerio.load(html);
+      successfulPages += 1;
+      if (source !== "CN" && !language.allArticlesUrl && pageUrl === language.homeUrl) {
+        for (const listingPage of discoverTargetListingPages($, pageUrl, source, options.maxPages)) {
+          if (queuedPages.has(listingPage)) continue;
+          queuedPages.add(listingPage);
+          pages.push(listingPage);
+        }
+      }
+
       const pageCandidates =
         source === "JP" && pageUrl.includes("/94765/")
           ? collectJapaneseListingCandidates($, pageUrl)
           : collectCandidates($, pageUrl, source, pageUrl);
 
+      let addedForDate = 0;
       for (const candidate of pageCandidates) {
         const date = candidate.urlDate || candidate.listDate;
         if (!dateScope.includes(date ?? "")) continue;
-        if (!candidates.has(candidate.url)) candidates.set(candidate.url, candidate);
+        if (!candidates.has(candidate.url)) {
+          candidates.set(candidate.url, candidate);
+          addedForDate += 1;
+        }
       }
 
-      if (source === "JP") {
-        const dates = pageCandidates
-          .map((candidate) => candidate.listDate || candidate.urlDate)
-          .filter(Boolean)
-          .sort();
-        const newestOnPage = dates.at(-1);
-        if (newestOnPage && newestOnPage < earliest) break;
+      const dates = pageCandidates
+        .map((candidate) => candidate.listDate || candidate.urlDate)
+        .filter(Boolean)
+        .sort();
+      const newestOnPage = dates.at(-1);
+      if (source !== "CN") {
+        if (language.allArticlesUrl && newestOnPage && newestOnPage < earliest) break;
+        continue;
       }
-    } catch {
-      continue;
+
+      if (newestOnPage && newestOnPage < earliest) {
+        stoppedPageBases.add(pageInfo.baseUrl);
+        continue;
+      }
+
+      if (pageInfo.pageNumber >= 2 && addedForDate === 0) {
+        const staleCount = (stalePageCounts.get(pageInfo.baseUrl) ?? 0) + 1;
+        stalePageCounts.set(pageInfo.baseUrl, staleCount);
+        if (staleCount >= 2) stoppedPageBases.add(pageInfo.baseUrl);
+      } else if (addedForDate > 0) {
+        stalePageCounts.set(pageInfo.baseUrl, 0);
+      }
+    } catch (error) {
+      if (isOptionalPaginationMiss(pageUrl, error)) {
+        stoppedPageBases.add(pageInfo.baseUrl);
+      } else {
+        warnings.push(`${getPeopleLanguageConfig(source).warningLabel}一覧取得失敗: ${pageUrl} (${errorMessage(error)})`);
+      }
     }
   }
 
-  return [...candidates.values()].sort((a, b) => scoreCandidate(b, source) - scoreCandidate(a, source));
+  return {
+    candidates: [...candidates.values()].sort(
+      (a, b) => scoreCandidate(b, source) - scoreCandidate(a, source)
+    ),
+    warnings: trimWarnings(warnings),
+    attemptedPages,
+    successfulPages
+  };
+}
+
+function selectDailyCandidates(
+  candidates: Candidate[],
+  dateScope: string[],
+  maxArticles: number
+) {
+  const limit = Math.max(1, Math.round(maxArticles));
+  const groups = new Map(dateScope.map((date) => [date, [] as Candidate[]]));
+  const selected: Candidate[] = [];
+  const seen = new Set<string>();
+
+  for (const candidate of candidates) {
+    const date = candidate.urlDate || candidate.listDate;
+    const group = date ? groups.get(date) : undefined;
+    if (group) group.push(candidate);
+  }
+
+  while (selected.length < limit) {
+    let added = false;
+    for (const date of dateScope) {
+      const candidate = groups.get(date)?.shift();
+      if (!candidate || seen.has(candidate.url)) continue;
+      seen.add(candidate.url);
+      selected.push(candidate);
+      added = true;
+      if (selected.length >= limit) break;
+    }
+    if (!added) break;
+  }
+
+  return selected;
 }
 
 function collectCandidates(
@@ -188,7 +359,7 @@ function collectCandidates(
     const title = cleanTitle(anchor.text() || anchor.attr("title") || "");
     const url = normalizeUrl(rawHref, homeUrl);
 
-    if (!url || !title || title.length < (source === "CN" ? 6 : 5)) return;
+    if (!url || !title || title.length < getPeopleLanguageConfig(source).minTitleLength) return;
     if (!isLikelyArticleUrl(url, source)) return;
     if (seen.has(url)) return;
 
@@ -232,24 +403,193 @@ function collectJapaneseListingCandidates($: cheerio.CheerioAPI, pageUrl: string
   return candidates.sort((a, b) => scoreCandidate(b, "JP") - scoreCandidate(a, "JP"));
 }
 
+async function queryPeopleSearch(query: string, limit: number): Promise<Candidate[]> {
+  const response = await fetch("http://search.people.cn/search-platform/front/search", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "user-agent": USER_AGENT,
+      origin: "http://search.people.cn",
+      referer: "http://search.people.cn/s/"
+    },
+    body: JSON.stringify({
+      key: query,
+      page: 1,
+      limit
+    }),
+    cache: "no-store",
+    signal: AbortSignal.timeout(12000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Fetch failed ${response.status} for People search`);
+  }
+
+  const json = (await response.json()) as {
+    data?: {
+      records?: PeopleSearchRecord[];
+    };
+  };
+
+  return (json.data?.records ?? [])
+    .map((record) => candidateFromPeopleSearchRecord(record))
+    .filter((candidate): candidate is Candidate => Boolean(candidate));
+}
+
+function candidateFromPeopleSearchRecord(record: PeopleSearchRecord): Candidate | undefined {
+  const title = cleanTitle(stripInlineHtml(record.title ?? ""));
+  if (!record.url || !title || !isLikelyArticleUrl(record.url, "CN")) return undefined;
+  const listPublishedAt = peopleSearchTime(record.displayTime ?? record.inputTime);
+
+  return {
+    title,
+    url: record.url,
+    urlDate: extractDateFromUrl(record.url),
+    listPublishedAt,
+    listDate: normalizePublishedDate(listPublishedAt),
+    discoveredFrom: "http://search.people.cn/search-platform/front/search",
+    category: record.belongsName || inferCategory(record.url, title)
+  } satisfies Candidate;
+}
+
+function buildPeopleSearchQueries(article: Article) {
+  if (!isPeopleSearchWorthy(article)) return [];
+  const queries: string[] = [];
+  for (const title of [article.title, article.translatedTitle].filter(Boolean) as string[]) {
+    const foreignMinisterQuery = foreignMinisterTalkSearchQuery(title);
+    if (foreignMinisterQuery) queries.push(foreignMinisterQuery);
+    const foreignMinisterVisitQuery = foreignMinisterVisitSearchQuery(title);
+    if (foreignMinisterVisitQuery) queries.push(foreignMinisterVisitQuery);
+
+    const normalized = normalizeChineseSearchQuery(title);
+    if (isUsefulPeopleSearchQuery(normalized)) queries.push(normalized);
+  }
+
+  return [...new Set(queries)].slice(0, 2);
+}
+
+function isPeopleSearchWorthy(article: Article) {
+  const text = [article.title, article.translatedTitle, article.category, article.keywords.join(" ")]
+    .filter(Boolean)
+    .join(" ");
+  return /政治|国際|台湾|軍事|外交|外相|会談|イラン|ホルムズ|村山|米国|キューバ|再軍事化|导弹|導弾|王毅/.test(
+    text
+  );
+}
+
+function foreignMinisterTalkSearchQuery(input: string) {
+  const text = replaceForChineseSearch(input);
+  const match = text.match(
+    /(王毅|习近平|習近平)氏?が([\p{Script=Han}A-Za-z・]+)の([\p{Script=Han}A-Za-z・]+)外长と会谈/u
+  );
+  if (!match) return undefined;
+  return `${match[1]}同${match[2]}外长${match[3]}会谈`;
+}
+
+function foreignMinisterVisitSearchQuery(input: string) {
+  const text = replaceForChineseSearch(input);
+  const match = text.match(/([\p{Script=Han}A-Za-z・]+)の([\p{Script=Han}A-Za-z・]+)外长が将访华/u);
+  if (match) return `${match[1]}外长${match[2]}将访华`;
+  const normalized = normalizeChineseSearchQuery(input);
+  return /外长/.test(normalized) && /将访华/.test(normalized) ? normalized : undefined;
+}
+
+function normalizeChineseSearchQuery(input: string) {
+  return replaceForChineseSearch(input)
+    .replace(/[「」『』“”"'（）()\[\]【】]/g, "")
+    .replace(/氏/g, "")
+    .replace(/[がのをにはへでと、。・\s　]/g, "")
+    .replace(/について|に関する|めぐり/g, "")
+    .trim();
+}
+
+function replaceForChineseSearch(input: string) {
+  const replacements: Array<[RegExp, string]> = [
+    [/王毅氏/g, "王毅"],
+    [/習近平/g, "习近平"],
+    [/イラン/g, "伊朗"],
+    [/アラグチ/g, "阿拉格齐"],
+    [/外相/g, "外长"],
+    [/会談/g, "会谈"],
+    [/訪中へ|訪中予定|訪中する|中国を訪問へ/g, "将访华"],
+    [/ホルムズ海峡/g, "霍尔木兹海峡"],
+    [/米国|アメリカ/g, "美国"],
+    [/キューバ/g, "古巴"],
+    [/制裁/g, "制裁"],
+    [/外交部/g, "外交部"],
+    [/コメント/g, "回应"],
+    [/村山談話/g, "村山谈话"],
+    [/歴史を鑑とし|歴史を鑑/g, "以史为镜"],
+    [/時代的価値/g, "时代价值"],
+    [/守る/g, "守护"],
+    [/右翼勢力/g, "右翼势力"],
+    [/再軍事化/g, "再军事化"],
+    [/攻撃型ミサイル|導弾/g, "进攻型导弹"],
+    [/台湾/g, "台湾"]
+  ];
+
+  return replacements.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), input);
+}
+
+function isUsefulPeopleSearchQuery(query: string) {
+  return query.length >= 8 && query.length <= 48 && /[\p{Script=Han}]/u.test(query);
+}
+
+function stripInlineHtml(input: string) {
+  return input.replace(/<[^>]*>/g, "");
+}
+
+function peopleSearchTime(input: number | undefined) {
+  if (!input || !Number.isFinite(input)) return undefined;
+  return new Date(input).toISOString().slice(0, 10);
+}
+
 function cnDailySourcePages(maxPages: number) {
+  const cnHome = getPeopleLanguageConfig("CN").homeUrl;
   const bases = [
-    CN_HOME,
+    cnHome,
     "http://politics.people.com.cn/GB/1024/index.html",
     "http://finance.people.com.cn/GB/70846/index.html",
     "http://society.people.com.cn/GB/136657/index.html",
     "http://world.people.com.cn/GB/157278/index.html",
     "http://military.people.com.cn/index.html",
     "http://tw.people.com.cn/GB/index.html",
-    "http://ent.people.com.cn/GB/436801/index.html",
-    "http://health.people.com.cn/GB/415859/index.html"
+    "http://scitech.people.com.cn/GB/1057/index.html"
   ];
 
-  return bases.flatMap((base) => expandIndexPages(base, base === CN_HOME ? 1 : maxPages));
+  return bases.flatMap((base) => expandIndexPages(base, base === cnHome ? 1 : maxPages));
 }
 
-function jpDailySourcePages(maxPages: number) {
-  return expandIndexPages(JP_ALL_ARTICLES, maxPages);
+function targetDailySourcePages(source: Source, maxPages: number) {
+  const language = getPeopleLanguageConfig(source);
+  const base = language.allArticlesUrl ?? language.homeUrl;
+  return expandIndexPages(base, language.allArticlesUrl ? maxPages : 1);
+}
+
+function discoverTargetListingPages(
+  $: cheerio.CheerioAPI,
+  pageUrl: string,
+  source: Source,
+  maxPages: number
+) {
+  const language = getPeopleLanguageConfig(source);
+  const listingBases: string[] = [];
+  const seen = new Set<string>();
+
+  $("a").each((_, element) => {
+    const url = normalizeUrl($(element).attr("href"), pageUrl);
+    if (!url || seen.has(url)) return;
+    const parsed = new URL(url);
+    if (!language.articleHosts.includes(parsed.hostname)) return;
+    if (!/\/index\.html$/i.test(parsed.pathname)) return;
+    if (parsed.href === language.homeUrl) return;
+    seen.add(url);
+    listingBases.push(url);
+  });
+
+  return listingBases
+    .slice(0, 12)
+    .flatMap((base) => expandIndexPages(base, Math.min(maxPages, 5)));
 }
 
 function expandIndexPages(base: string, maxPages: number) {
@@ -260,7 +600,54 @@ function expandIndexPages(base: string, maxPages: number) {
   return pages;
 }
 
+function paginatedPageInfo(pageUrl: string) {
+  try {
+    const parsed = new URL(pageUrl);
+    const pageMatch = parsed.pathname.match(/index(\d*)\.html$/i);
+    const pageNumber = pageMatch?.[1] ? Number(pageMatch[1]) : 1;
+    parsed.pathname = parsed.pathname.replace(/index\d*\.html$/i, "index.html");
+    return {
+      baseUrl: parsed.toString(),
+      pageNumber: Number.isFinite(pageNumber) && pageNumber > 0 ? pageNumber : 1
+    };
+  } catch {
+    return { baseUrl: pageUrl, pageNumber: 1 };
+  }
+}
+
 async function fetchDecodedHtml(url: string) {
+  const { buffer, contentType } = await fetchHtmlBuffer(url);
+  const sniff = buffer.subarray(0, 4096).toString("latin1");
+  const charset =
+    contentType.match(/charset=([^;]+)/i)?.[1] ??
+    sniff.match(/charset=["']?([\w-]+)/i)?.[1] ??
+    "utf-8";
+
+  if (/gb2312|gbk|gb18030/i.test(charset)) {
+    return iconv.decode(buffer, "gb18030");
+  }
+
+  return iconv.decode(buffer, "utf-8");
+}
+
+async function fetchHtmlBuffer(url: string) {
+  try {
+    return await fetchHtmlBufferOnce(url);
+  } catch (error) {
+    const fallbackUrl = httpFallbackUrl(url, error);
+    if (!fallbackUrl) throw error;
+
+    try {
+      return await fetchHtmlBufferOnce(fallbackUrl);
+    } catch (fallbackError) {
+      throw new Error(
+        `${errorMessage(error)}; HTTP fallback failed: ${errorMessage(fallbackError)}`
+      );
+    }
+  }
+}
+
+async function fetchHtmlBufferOnce(url: string) {
   const response = await fetch(url, {
     headers: {
       "user-agent": USER_AGENT,
@@ -277,17 +664,22 @@ async function fetchDecodedHtml(url: string) {
 
   const buffer = Buffer.from(await response.arrayBuffer());
   const contentType = response.headers.get("content-type") ?? "";
-  const sniff = buffer.subarray(0, 4096).toString("latin1");
-  const charset =
-    contentType.match(/charset=([^;]+)/i)?.[1] ??
-    sniff.match(/charset=["']?([\w-]+)/i)?.[1] ??
-    "utf-8";
+  return { buffer, contentType };
+}
 
-  if (/gb2312|gbk|gb18030/i.test(charset)) {
-    return iconv.decode(buffer, "gb18030");
+function httpFallbackUrl(url: string, error: unknown) {
+  if (!isTlsCertificateError(error)) return undefined;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return undefined;
+    if (!parsed.hostname.endsWith("people.com.cn") && !parsed.hostname.endsWith("people.cn")) {
+      return undefined;
+    }
+    parsed.protocol = "http:";
+    return parsed.toString();
+  } catch {
+    return undefined;
   }
-
-  return iconv.decode(buffer, "utf-8");
 }
 
 function normalizeUrl(rawHref: string | undefined, base: string) {
@@ -301,19 +693,64 @@ function normalizeUrl(rawHref: string | undefined, base: string) {
   }
 }
 
+function cachedArticle(source: Source, url: string) {
+  return articleCache().get(articleCacheKey(source, url));
+}
+
+function rememberArticle(article: Article) {
+  const cache = articleCache();
+  const key = articleCacheKey(article.source, article.url);
+  if (cache.has(key)) cache.delete(key);
+  cache.set(key, article);
+
+  while (cache.size > ARTICLE_CACHE_LIMIT) {
+    const oldest = cache.keys().next().value;
+    if (!oldest) break;
+    cache.delete(oldest);
+  }
+
+  return article;
+}
+
+function articleCache() {
+  globalThis.__PEOPLEDIFF_ARTICLE_CACHE__ ??= new Map<string, Article>();
+  return globalThis.__PEOPLEDIFF_ARTICLE_CACHE__;
+}
+
+function articleCacheKey(source: Source, url: string) {
+  return `${source}:${url}`;
+}
+
+function scrapeConcurrency() {
+  const configured = Number(process.env.PEOPLEDIFF_SCRAPE_CONCURRENCY);
+  if (!Number.isFinite(configured) || configured <= 0) return 16;
+  return Math.min(32, Math.max(4, Math.round(configured)));
+}
+
 function isLikelyArticleUrl(url: string, source: Source) {
   const parsed = new URL(url);
   const host = parsed.hostname;
   const path = parsed.pathname;
+  const language = getPeopleLanguageConfig(source);
 
   if (!path.endsWith(".html")) return false;
-  if (source === "JP") {
-    return host === "j.people.com.cn" && /\/n\d\/\d{4}\/\d{4}\//.test(path);
+  if (source !== "CN") {
+    return language.articleHosts.includes(host) && /\/n\d\/\d{4}\/\d{4}\//.test(path);
   }
 
-  if (!host.endsWith("people.com.cn") || host === "j.people.com.cn") return false;
+  if (!isChineseArticleHost(host)) return false;
   if (/pic|photo|video|tv|fangtan/i.test(host + path)) return false;
   return /\/n\d\/\d{4}\/\d{4}\//.test(path) || /\/GB\/.+\.html$/.test(path);
+}
+
+function isChineseArticleHost(host: string) {
+  if (!host.endsWith("people.com.cn") && !host.endsWith("people.cn")) return false;
+  const nonChineseHosts = new Set(
+    PEOPLE_LANGUAGE_CODES
+      .filter((code) => code !== "CN")
+      .flatMap((code) => getPeopleLanguageConfig(code).articleHosts)
+  );
+  return !nonChineseHosts.has(host);
 }
 
 function scoreCandidate(candidate: Candidate, source: Source) {
@@ -359,23 +796,32 @@ function extractBody($: cheerio.CheerioAPI) {
       .find("p")
       .map((_, p) => cleanText($(p).text()))
       .get()
-      .filter((line) => line.length > 20);
+      .filter(isContentParagraph);
     const body = cleanText(paragraphs.join("\n\n"));
-    if (body.length > 120) return body;
+    if (body.length > 40) return body;
   }
 
   const fallback = $("p")
     .map((_, p) => cleanText($(p).text()))
     .get()
-    .filter((line) => line.length > 24)
+    .filter(isContentParagraph)
     .join("\n\n");
 
   return cleanText(fallback);
 }
 
+function isContentParagraph(line: string) {
+  if (line.length < 12) return false;
+  return !/人民日报社概况|关于人民网|违法和不良信息|举报邮箱|互联网新闻信息服务许可证|增值电信业务经营许可证|京ICP备|京公网安备|版权所有|Copyright/i.test(
+    line
+  );
+}
+
 function extractCategory($: cheerio.CheerioAPI, url: string, fallback?: string) {
   const pathCategory = inferCategoryFromPath(url);
   if (pathCategory) return pathCategory;
+  const urlCategory = inferCategory(url, "");
+  if (urlCategory) return urlCategory;
 
   const breadcrumb = $(
     ".path a, .p2j_con03_left_nav a, .gray a, .breadcrumb a, .crumb a"
@@ -389,7 +835,7 @@ function extractCategory($: cheerio.CheerioAPI, url: string, fallback?: string) 
         !/首页|トップ|ホーム|人民|ニュース|新着|最新/.test(text)
     );
 
-  return breadcrumb || inferCategory(url, "") || fallback;
+  return breadcrumb || fallback;
 }
 
 function extractPublishedAt($: cheerio.CheerioAPI) {
@@ -480,7 +926,52 @@ function normalizeDateScope(dates: string[] | undefined) {
 function normalizeDateInput(input: string | undefined) {
   const match = input?.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (!match) return undefined;
-  return `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
+  const normalized = `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
+  return isRealDate(normalized) ? normalized : undefined;
+}
+
+function isRealDate(input: string) {
+  const [year, month, day] = input.split("-").map(Number);
+  if (!year || !month || !day) return false;
+  const value = new Date(Date.UTC(year, month - 1, day));
+  return value.toISOString().slice(0, 10) === input;
+}
+
+function errorMessage(error: unknown) {
+  if (!(error instanceof Error)) return String(error);
+
+  const cause = error.cause;
+  if (isNodeError(cause) && cause.code) {
+    return `${error.message}: ${cause.code}`;
+  }
+
+  return error.message;
+}
+
+function isTlsCertificateError(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  const cause = error.cause;
+  if (isNodeError(cause)) {
+    return (
+      cause.code === "ERR_TLS_CERT_ALTNAME_INVALID" ||
+      cause.code === "CERT_HAS_EXPIRED" ||
+      cause.code === "DEPTH_ZERO_SELF_SIGNED_CERT"
+    );
+  }
+
+  return /certificate|cert|altname|TLS/i.test(error.message);
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === "object" && error !== null && "code" in error;
+}
+
+function isOptionalPaginationMiss(pageUrl: string, error: unknown) {
+  return /index\d+\.html$/i.test(new URL(pageUrl).pathname) && /Fetch failed 404/.test(errorMessage(error));
+}
+
+function trimWarnings(warnings: string[]) {
+  return [...new Set(warnings)].slice(0, 8);
 }
 
 async function mapWithConcurrency<T, R>(
