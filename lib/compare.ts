@@ -23,6 +23,12 @@ import {
   type ArticleMatch
 } from "./matcher";
 import { scrapePeopleDetailed, searchPeopleChineseArticlesForTargets } from "./scraper";
+import {
+  buildRefreshRunMetadata,
+  createRefreshTelemetryState,
+  logRefreshRun,
+  withRefreshTelemetry
+} from "./telemetry";
 import { stableId } from "./text";
 
 type RefreshOptions = {
@@ -47,6 +53,14 @@ type RefreshOptions = {
 };
 
 export async function refreshSnapshot(options: RefreshOptions = {}): Promise<RefreshResult> {
+  const telemetry = createRefreshTelemetryState();
+  return withRefreshTelemetry(telemetry, () => refreshSnapshotWithTelemetry(options, telemetry));
+}
+
+async function refreshSnapshotWithTelemetry(
+  options: RefreshOptions,
+  telemetry: ReturnType<typeof createRefreshTelemetryState>
+): Promise<RefreshResult> {
   const limit = clampLimit(options.limit ?? 8);
   const targetDateScope = resolveTargetDateScope(options);
   const dateScope = targetDateScope;
@@ -132,10 +146,11 @@ export async function refreshSnapshot(options: RefreshOptions = {}): Promise<Ref
     languageSelection.targetLanguage
   );
 
-  return {
+  const result: RefreshResult = {
     generatedAt: new Date().toISOString(),
     mode: "live",
     model: activeModelLabel(),
+    run: buildRefreshRunMetadata(telemetry, warnings.length),
     schemaVersion: 2,
     refreshSignature: refreshOptionsSignature(options),
     baseLanguage: languageSelection.sourceLanguage,
@@ -159,6 +174,8 @@ export async function refreshSnapshot(options: RefreshOptions = {}): Promise<Ref
     ),
     warnings
   };
+  logRefreshRun(result);
+  return result;
 }
 
 export function refreshOptionsSignature(options: RefreshOptions = {}) {
@@ -192,6 +209,7 @@ export function emptySnapshot(): RefreshResult {
     generatedAt: new Date().toISOString(),
     mode: "empty",
     model: activeModelLabel(),
+    run: buildRefreshRunMetadata(createRefreshTelemetryState(), 0),
     schemaVersion: 2,
     baseLanguage: "CN",
     targetLanguage: "JP",

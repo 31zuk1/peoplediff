@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { getPeopleLanguageConfig } from "./languages";
+import { recordOpenAiCompletionUsage } from "./telemetry";
 import type { Article, DifferenceAnalysis } from "./types";
 import { compactSummary, extractKeywords, truncate } from "./text";
 
@@ -383,12 +384,14 @@ async function askJson<T>(
   messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
   options: { model?: string; temperature?: number } = {}
 ): Promise<T> {
+  const model = options.model ?? MODEL;
   const completion = await openai.chat.completions.create({
-    model: options.model ?? MODEL,
+    model,
     temperature: options.temperature ?? 0.2,
     response_format: { type: "json_object" },
     messages
   });
+  recordOpenAiCompletionUsage(model, completion.usage);
 
   const content = completion.choices[0]?.message?.content || "{}";
   return JSON.parse(content) as T;

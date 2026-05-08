@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
+import { createHash } from "node:crypto";
+import { isAuthorizedAdminRequest } from "@/lib/auth";
 import { readSnapshot, writeSnapshot } from "@/lib/cache";
 import { refreshOptionsSignature, refreshSnapshot } from "@/lib/compare";
+import { acquireSnapshotLock } from "@/lib/snapshot-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,6 +30,10 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  if (!isAuthorizedAdminRequest(request)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     const { searchParams } = new URL(request.url);
     const body = asRecord(await request.json().catch(() => ({})));
@@ -47,11 +54,12 @@ export async function POST(request: Request) {
       ),
       targetDateTo: stringValue(firstValue(body.targetDateTo, searchParams.get("targetDateTo"))),
       sourceLookbackDays: numberValue(
-        firstValue(body.sourceLookbackDays, searchParams.get("sourceLookbackDays"))
+        firstValue(body.sourceLookbackDays, searchParams.get("sourceLookbackDays")),
+        7
       ),
-      maxPages: numberValue(firstValue(body.maxPages, searchParams.get("maxPages"))),
-      maxArticles: numberValue(firstValue(body.maxArticles, searchParams.get("maxArticles"))),
-      aiArticleLimit: numberValue(aiArticleLimit),
+      maxPages: numberValue(firstValue(body.maxPages, searchParams.get("maxPages")), 12),
+      maxArticles: numberValue(firstValue(body.maxArticles, searchParams.get("maxArticles")), 480),
+      aiArticleLimit: numberValue(aiArticleLimit, 120),
       sourceLanguage: firstValue(
         body.sourceLanguage,
         body.source,
@@ -95,10 +103,24 @@ export async function POST(request: Request) {
       });
     }
 
+    const lock = await acquireSnapshotLock(refreshLockName(signature), refreshLockTtlMs());
+    if (!lock) {
+      return NextResponse.json(
+        { error: "Refresh already running", refreshSignature: signature },
+        {
+          status: 409,
+          headers: {
+            "x-peoplediff-cache": "locked"
+          }
+        }
+      );
+    }
+
     const refreshTask = refreshSnapshot(refreshOptions)
       .then((snapshot) => writeSnapshot(snapshot))
       .finally(() => {
         inFlight.delete(signature);
+        void lock.release();
       });
     inFlight.set(signature, refreshTask);
     const archivedSnapshot = await refreshTask;
@@ -126,10 +148,12 @@ function stringValue(value: unknown) {
   return typeof value === "string" ? value : undefined;
 }
 
-function numberValue(value: unknown) {
+function numberValue(value: unknown, max?: number) {
   if (value === undefined) return undefined;
   const number = Number(value);
-  return Number.isFinite(number) ? number : undefined;
+  if (!Number.isFinite(number)) return undefined;
+  const rounded = Math.max(0, Math.round(number));
+  return typeof max === "number" ? Math.min(max, rounded) : rounded;
 }
 
 function booleanValue(value: unknown) {
@@ -168,4 +192,14 @@ function isFreshMatchingSnapshot(
 function refreshInFlight() {
   globalThis.__PEOPLEDIFF_REFRESH_INFLIGHT__ ??= new Map();
   return globalThis.__PEOPLEDIFF_REFRESH_INFLIGHT__;
+}
+
+function refreshLockName(signature: string) {
+  return createHash("sha256").update(signature).digest("hex").slice(0, 32);
+}
+
+function refreshLockTtlMs() {
+  const configured = Number(process.env.PEOPLEDIFF_REFRESH_LOCK_TTL_SECONDS);
+  if (!Number.isFinite(configured) || configured <= 0) return 10 * 60 * 1000;
+  return Math.min(60 * 60 * 1000, Math.max(60 * 1000, Math.round(configured) * 1000));
 }

@@ -1,13 +1,9 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import type { Source } from "./types";
 import type { Article, ArticlePair, RefreshResult } from "./types";
 import { calculateStats, emptySnapshot } from "./compare";
 import { getAvailableLanguageSummaries, resolveCompareLanguages } from "./languages";
+import { createSnapshotStore, snapshotStorageBackend, usesDurableSnapshotStore } from "./snapshot-store";
 
-const LEGACY_CACHE_PATH = path.join("/tmp", "peoplediff-cache.json");
-const FALLBACK_ARCHIVE_DIR = path.join("/tmp", "peoplediff-snapshots");
-const PROJECT_ARCHIVE_DIR = path.join(process.cwd(), "data", "snapshots");
 const LATEST_FILE = "latest.json";
 const INDEX_FILE = "index.json";
 const DEFAULT_COMPARISON_KEY = "CN-JP";
@@ -20,8 +16,6 @@ declare global {
   var __PEOPLEDIFF_CACHE_BY_KEY__: Record<string, RefreshResult> | undefined;
   // eslint-disable-next-line no-var
   var __PEOPLEDIFF_CACHE_BY_DATE__: Record<string, RefreshResult> | undefined;
-  // eslint-disable-next-line no-var
-  var __PEOPLEDIFF_WRITABLE_DIR__: string | undefined;
 }
 
 type SnapshotReadOptions = {
@@ -37,18 +31,16 @@ export async function readSnapshot(date?: string, options: SnapshotReadOptions =
   const normalizedDate = normalizeArchiveDate(date);
   if (normalizedDate) return readDatedSnapshot(normalizedDate, key);
 
-  const cachedByKey = globalThis.__PEOPLEDIFF_CACHE_BY_KEY__?.[key];
-  if (cachedByKey) {
-    return withArchiveDates(cachedByKey, undefined, key);
-  }
+  const useMemoryCache = !usesDurableSnapshotStore();
+  const cachedByKey = useMemoryCache ? globalThis.__PEOPLEDIFF_CACHE_BY_KEY__?.[key] : undefined;
+  if (cachedByKey) return withArchiveDates(cachedByKey, undefined, key);
 
-  if (key === DEFAULT_COMPARISON_KEY && globalThis.__PEOPLEDIFF_CACHE__) {
+  if (useMemoryCache && key === DEFAULT_COMPARISON_KEY && globalThis.__PEOPLEDIFF_CACHE__) {
     return withArchiveDates(globalThis.__PEOPLEDIFF_CACHE__);
   }
 
-  const latest = await readFirstJson<RefreshResult>(
-    archiveDirs().map((dir) => path.join(dir, latestFileName(key)))
-  );
+  const store = createSnapshotStore();
+  const latest = await store.readJson<RefreshResult>(latestFileName(key));
   if (latest) {
     const cleanSnapshot = stripArchiveMetadata(latest);
     rememberSnapshot(cleanSnapshot, key);
@@ -58,7 +50,7 @@ export async function readSnapshot(date?: string, options: SnapshotReadOptions =
   const latestDate = (await listArchiveDates(key))[0];
   if (latestDate) return readDatedSnapshot(latestDate, key);
 
-  const legacy = key === DEFAULT_COMPARISON_KEY ? await readFirstJson<RefreshResult>([LEGACY_CACHE_PATH]) : undefined;
+  const legacy = key === DEFAULT_COMPARISON_KEY ? await store.readLegacyJson?.<RefreshResult>() : undefined;
   if (legacy) {
     globalThis.__PEOPLEDIFF_CACHE__ = stripArchiveMetadata(legacy);
     return withArchiveDates(globalThis.__PEOPLEDIFF_CACHE__);
@@ -77,36 +69,40 @@ export async function readSnapshot(date?: string, options: SnapshotReadOptions =
 
 export async function writeSnapshot(snapshot: RefreshResult) {
   const cleanSnapshot = stripArchiveMetadata(snapshot);
-  const writableDir = await writableArchiveDir();
-  const dailySnapshots = splitSnapshotByDate(cleanSnapshot);
-  const key = comparisonKeyFromSnapshot(cleanSnapshot);
+  const storedSnapshot: RefreshResult = cleanSnapshot.run
+    ? {
+        ...cleanSnapshot,
+        run: { ...cleanSnapshot.run, storageBackend: snapshotStorageBackend() }
+      }
+    : cleanSnapshot;
+  const store = createSnapshotStore();
+  const dailySnapshots = splitSnapshotByDate(storedSnapshot);
+  const key = comparisonKeyFromSnapshot(storedSnapshot);
 
-  rememberSnapshot(cleanSnapshot, key);
+  await Promise.all(
+    [...dailySnapshots].map(([date, dailySnapshot]) =>
+      store.writeJson(datedFileName(date, key), dailySnapshot)
+    )
+  );
+  await store.writeJson(latestFileName(key), storedSnapshot);
+  await writeIndex(store, key);
+
+  rememberSnapshot(storedSnapshot, key);
   globalThis.__PEOPLEDIFF_CACHE_BY_DATE__ = {
     ...(globalThis.__PEOPLEDIFF_CACHE_BY_DATE__ ?? {}),
     ...Object.fromEntries([...dailySnapshots].map(([date, daily]) => [datedCacheKey(date, key), daily]))
   };
 
-  if (writableDir) {
-    await writeJson(path.join(writableDir, latestFileName(key)), cleanSnapshot);
-    await Promise.all(
-      [...dailySnapshots].map(([date, dailySnapshot]) =>
-        writeJson(path.join(writableDir, datedFileName(date, key)), dailySnapshot)
-      )
-    );
-    await writeIndex(writableDir, key);
-  }
-
-  return withArchiveDates(cleanSnapshot, undefined, key);
+  return withArchiveDates(storedSnapshot, undefined, key);
 }
 
 async function readDatedSnapshot(date: string, key = DEFAULT_COMPARISON_KEY) {
-  const cached = globalThis.__PEOPLEDIFF_CACHE_BY_DATE__?.[datedCacheKey(date, key)];
+  const cached = !usesDurableSnapshotStore()
+    ? globalThis.__PEOPLEDIFF_CACHE_BY_DATE__?.[datedCacheKey(date, key)]
+    : undefined;
   if (cached) return withArchiveDates(cached, date, key);
 
-  const archived = await readFirstJson<RefreshResult>(
-    archiveDirs().map((dir) => path.join(dir, datedFileName(date, key)))
-  );
+  const archived = await createSnapshotStore().readJson<RefreshResult>(datedFileName(date, key));
   if (archived) {
     const cleanSnapshot = stripArchiveMetadata(archived);
     globalThis.__PEOPLEDIFF_CACHE_BY_DATE__ = {
@@ -254,73 +250,18 @@ function articleDate(article?: Article) {
 }
 
 async function listArchiveDates(key = DEFAULT_COMPARISON_KEY) {
-  const files = await Promise.all(
-    archiveDirs().map(async (dir) => {
-      try {
-        return await fs.readdir(dir);
-      } catch {
-        return [];
-      }
-    })
-  );
-
-  return [...new Set(files.flat().map((file) => archiveDateFromFile(file, key)).filter(isDate))]
+  const names = await createSnapshotStore().listNames();
+  return [...new Set(names.map((file) => archiveDateFromFile(file, key)).filter(isDate))]
     .sort((a, b) => b.localeCompare(a));
 }
 
-async function writableArchiveDir() {
-  if (globalThis.__PEOPLEDIFF_WRITABLE_DIR__) return globalThis.__PEOPLEDIFF_WRITABLE_DIR__;
-
-  for (const dir of archiveDirs()) {
-    try {
-      await fs.mkdir(dir, { recursive: true });
-      const testPath = path.join(dir, ".write-test");
-      await fs.writeFile(testPath, "ok", "utf8");
-      await fs.unlink(testPath).catch(() => undefined);
-      globalThis.__PEOPLEDIFF_WRITABLE_DIR__ = dir;
-      return dir;
-    } catch {
-      // Try the next candidate. Vercel's project filesystem is read-only at runtime.
-    }
-  }
-
-  return undefined;
-}
-
-function archiveDirs() {
-  return [...new Set([primaryArchiveDir(), FALLBACK_ARCHIVE_DIR])];
-}
-
-function primaryArchiveDir() {
-  const override = process.env.PEOPLEDIFF_DATA_DIR?.trim();
-  if (override) return path.resolve(override);
-  return PROJECT_ARCHIVE_DIR;
-}
-
-async function writeIndex(dir: string, key = DEFAULT_COMPARISON_KEY) {
+async function writeIndex(store: ReturnType<typeof createSnapshotStore>, key = DEFAULT_COMPARISON_KEY) {
   const dates = await listArchiveDates(key);
-  await writeJson(path.join(dir, indexFileName(key)), {
+  await store.writeJson(indexFileName(key), {
     updatedAt: new Date().toISOString(),
     comparisonKey: key,
     dates
   });
-}
-
-async function writeJson(filePath: string, value: unknown) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(value, null, 2), "utf8");
-}
-
-async function readFirstJson<T>(paths: string[]) {
-  for (const filePath of paths) {
-    try {
-      const raw = await fs.readFile(filePath, "utf8");
-      return JSON.parse(raw) as T;
-    } catch {
-      // Keep walking the fallback chain.
-    }
-  }
-  return undefined;
 }
 
 function stripArchiveMetadata(snapshot: RefreshResult): RefreshResult {

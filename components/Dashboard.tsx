@@ -22,6 +22,7 @@ import StatusBadge from "./StatusBadge";
 
 type Props = {
   initialData: RefreshResult;
+  allowRefresh?: boolean;
 };
 
 type StatusFilter = "ALL" | "BASE_ONLY" | "TARGET_ONLY" | "MATCHED";
@@ -55,7 +56,7 @@ const controlBase =
 const controlIconClass =
   "pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500";
 
-export default function Dashboard({ initialData }: Props) {
+export default function Dashboard({ initialData, allowRefresh = false }: Props) {
   const [data, setData] = useState(initialData);
   const [selectedId, setSelectedId] = useState(data.pairs[0]?.id ?? "");
   const [query, setQuery] = useState("");
@@ -290,6 +291,12 @@ export default function Dashboard({ initialData }: Props) {
                   対象期間 {formatScopeRange(data.targetDateScope?.length ? data.targetDateScope : data.dateScope)}
                 </span>
               ) : null}
+              {data.run ? (
+                <span className="rounded border border-white/10 bg-white/[0.03] px-2.5 py-1">
+                  {data.run.storageBackend} / {data.run.openaiCalls} AI / $
+                  {data.run.estimatedOpenAiCostUsd.toFixed(4)}
+                </span>
+              ) : null}
             </div>
             <h1 className="text-balance text-3xl font-semibold tracking-normal text-white sm:text-5xl">
               PeopleDiff
@@ -336,15 +343,17 @@ export default function Dashboard({ initialData }: Props) {
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
               {theme === "dark" ? "White" : "Dark"}
             </button>
-            <button
-              type="button"
-              onClick={() => refresh()}
-              disabled={isPending || selectedDateScope.length === 0}
-              className="inline-flex h-11 min-w-[10rem] items-center justify-center gap-2 rounded-md border border-emerald-300/30 bg-emerald-300/14 px-4 text-sm font-semibold text-emerald-50 transition hover:bg-emerald-300/20 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              <RefreshCw className={clsx("h-4 w-4", isPending && "animate-spin")} />
-              最新記事を更新
-            </button>
+            {allowRefresh ? (
+              <button
+                type="button"
+                onClick={() => refresh()}
+                disabled={isPending || selectedDateScope.length === 0}
+                className="inline-flex h-11 min-w-[10rem] items-center justify-center gap-2 rounded-md border border-emerald-300/30 bg-emerald-300/14 px-4 text-sm font-semibold text-emerald-50 transition hover:bg-emerald-300/20 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <RefreshCw className={clsx("h-4 w-4", isPending && "animate-spin")} />
+                最新記事を更新
+              </button>
+            ) : null}
           </div>
         </header>
 
@@ -485,7 +494,11 @@ export default function Dashboard({ initialData }: Props) {
         ) : null}
 
         {data.pairs.length === 0 ? (
-          <EmptyState isPending={isPending} onRefresh={() => refresh()} />
+          <EmptyState
+            allowRefresh={allowRefresh}
+            isPending={isPending}
+            onRefresh={() => refresh()}
+          />
         ) : filteredPairs.length === 0 ? (
           <NoFilteredResults />
         ) : (
@@ -930,9 +943,11 @@ function NarrativeTile({ label, value }: { label: string; value: string }) {
 }
 
 function EmptyState({
+  allowRefresh,
   isPending,
   onRefresh
 }: {
+  allowRefresh: boolean;
   isPending: boolean;
   onRefresh: () => void;
 }) {
@@ -944,17 +959,19 @@ function EmptyState({
         </div>
         <h2 className="text-xl font-semibold text-white">No snapshot</h2>
         <p className="mt-2 text-sm leading-6 text-slate-400">
-          基準言語版と対象言語版のライブ取得待ちです。
+          基準言語版と対象言語版の保存済みスナップショット待ちです。
         </p>
-        <button
-          type="button"
-          onClick={onRefresh}
-          disabled={isPending}
-          className="mt-5 inline-flex h-10 items-center gap-2 rounded border border-cyan-200/30 bg-cyan-300/12 px-4 text-sm font-semibold text-cyan-50 transition hover:bg-cyan-300/20 disabled:opacity-60"
-        >
-          <RefreshCw className={clsx("h-4 w-4", isPending && "animate-spin")} />
-          最新記事を更新
-        </button>
+        {allowRefresh ? (
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={isPending}
+            className="mt-5 inline-flex h-10 items-center gap-2 rounded border border-cyan-200/30 bg-cyan-300/12 px-4 text-sm font-semibold text-cyan-50 transition hover:bg-cyan-300/20 disabled:opacity-60"
+          >
+            <RefreshCw className={clsx("h-4 w-4", isPending && "animate-spin")} />
+            最新記事を更新
+          </button>
+        ) : null}
       </div>
     </section>
   );

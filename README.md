@@ -60,6 +60,22 @@ OPENAI_REPAIR_MODEL=gpt-4.1-nano
 
 # Defaults to ./data/snapshots
 PEOPLEDIFF_DATA_DIR=/absolute/path/to/snapshots
+
+# Defaults to local file storage unless BLOB_READ_WRITE_TOKEN is set
+PEOPLEDIFF_STORAGE=blob
+
+# Vercel Blob read-write token
+BLOB_READ_WRITE_TOKEN=vercel_blob_rw_...
+
+# Defaults to snapshots/
+PEOPLEDIFF_BLOB_PREFIX=snapshots/
+
+# Required for protected refresh endpoints
+PEOPLEDIFF_ADMIN_TOKEN=change-me
+CRON_SECRET=change-me-too
+
+# Optional. Comma/space-separated cron target languages. Defaults to JP.
+PEOPLEDIFF_CRON_TARGETS=JP,EN
 ```
 
 起動:
@@ -110,7 +126,7 @@ API keyがある場合は、以下が有効になります。
 
 ## Data Archives
 
-更新時、取得結果は日付別に分割されます。
+更新時、取得結果は日付別に分割されます。ローカルでは既定でファイル保存を使います。
 
 ```text
 data/snapshots/latest.json
@@ -129,6 +145,8 @@ curl "http://localhost:3000/api/refresh?date=2026-05-07&targetLanguage=EN"
 
 注意: `data/snapshots/*.json` は `.gitignore` 対象です。履歴データはリポジトリにコミットしない前提です。
 
+本番で `PEOPLEDIFF_STORAGE=blob` を指定するか `BLOB_READ_WRITE_TOKEN` が存在する場合、同じスナップショット名をVercel Blobに保存します。既定のBlobパスは `snapshots/latest.json`、`snapshots/YYYY-MM-DD.json`、`snapshots/index.json` です。`CN-JP` 以外はファイル保存と同じく `latest.CN-EN.json`、`YYYY-MM-DD.CN-EN.json`、`index.CN-EN.json` のように言語ペア付きで保存されます。
+
 ## API
 
 ### `GET /api/refresh`
@@ -143,9 +161,20 @@ curl "http://localhost:3000/api/refresh?date=2026-05-07&targetLanguage=EN"
 
 ### `POST /api/refresh`
 
-両サイトを取得し、本文抽出、記事マッチング、OpenAI比較、キャッシュ更新、日付別保存を行います。
+`PEOPLEDIFF_ADMIN_TOKEN` で保護された管理者向け更新APIです。両サイトを取得し、本文抽出、記事マッチング、OpenAI比較、キャッシュ更新、日付別保存を行います。トークンは `Authorization: Bearer <token>` で送ります。
+
+無認証または不正なトークンのPOSTは、スクレイピングやOpenAI処理を開始する前に `401` を返します。公開画面や外部利用は `GET /api/refresh` の読み取りに限定し、重い更新処理はこのPOSTまたはcronに寄せます。
 
 例:
+
+```bash
+curl -X POST "http://localhost:3000/api/refresh" \
+  -H "Authorization: Bearer $PEOPLEDIFF_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"targetLanguage":"EN","dates":["2026-05-07","2026-05-06"]}'
+```
+
+リクエスト本文:
 
 ```json
 {
@@ -162,6 +191,17 @@ curl "http://localhost:3000/api/refresh?date=2026-05-07&targetLanguage=EN"
 
 `dates` / `dateFrom` / `dateTo` を省略した場合は、トップページ中心の小さなサンプル取得になります。
 
+### `GET /api/cron/refresh`
+
+Vercel Cron向けの更新APIです。`CRON_SECRET` を `Authorization: Bearer <secret>` で受け取り、`PEOPLEDIFF_CRON_TARGETS` に指定した対象言語を、JST基準の今日/昨日で更新します。
+
+```bash
+curl "http://localhost:3000/api/cron/refresh" \
+  -H "Authorization: Bearer $CRON_SECRET"
+```
+
+cronの既定スケジュールは `vercel.json` の `5 16 * * *` です。これはUTC指定なので、日本時間では毎日01:05に実行されます。
+
 ## Project Structure
 
 ```text
@@ -173,6 +213,8 @@ components/
   StatusBadge.tsx        Status label component
 lib/
   cache.ts               Latest + daily archive storage
+  snapshot-store.ts      Snapshot storage selector and Vercel Blob store
+  local-snapshot-store.ts Local file snapshot store
   compare.ts             Refresh pipeline and stats
   languages.ts           People's Daily language registry
   matcher.ts             Article matching
@@ -194,9 +236,14 @@ Vercelにデプロイできます。
    - `OPENAI_API_KEY`
    - optional: `OPENAI_MODEL`
    - optional: `OPENAI_REPAIR_MODEL`
+   - `PEOPLEDIFF_ADMIN_TOKEN`
+   - `CRON_SECRET`
+   - optional: `PEOPLEDIFF_CRON_TARGETS`
+   - optional: `PEOPLEDIFF_STORAGE=blob`
+   - optional: `BLOB_READ_WRITE_TOKEN`
 4. Deploy
 
-重要: Vercel serverlessの実行時ファイルシステムは永続ではありません。このリポジトリの `data/snapshots` 保存は、ローカルや永続ディスクのあるサーバー向けのPoC保存層です。継続運用で履歴を確実に残す場合は、Vercel Blob、KV、Postgres、S3などに `lib/cache.ts` を差し替えてください。
+重要: Vercel serverlessの実行時ファイルシステムは永続ではありません。本番で履歴を残す場合は、Vercel Blob storeを作成し、`BLOB_READ_WRITE_TOKEN` を環境変数に設定してください。`PEOPLEDIFF_STORAGE=blob` を併用すると、トークン未設定時に明示的に失敗します。Blobを使わないローカル/永続ディスク環境では、従来通り `data/snapshots` または `PEOPLEDIFF_DATA_DIR` に保存されます。
 
 ## Current Limitations
 

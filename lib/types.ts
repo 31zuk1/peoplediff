@@ -105,10 +105,29 @@ export type RefreshStats = {
   coverageRatio: number;
 };
 
+export type RefreshRunMetadata = {
+  runId: string;
+  durationMs: number;
+  warningCount: number;
+  openaiCalls: number;
+  openaiInputTokens: number;
+  openaiOutputTokens: number;
+  openaiModelUsage?: Array<{
+    model: string;
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    estimatedCostUsd: number;
+  }>;
+  estimatedOpenAiCostUsd: number;
+  storageBackend: string;
+};
+
 export type RefreshResult = {
   generatedAt: string;
   mode: "live" | "demo" | "empty";
   model: string;
+  run?: RefreshRunMetadata;
   schemaVersion?: number;
   refreshSignature?: string;
   baseLanguage?: Source;
