@@ -127,7 +127,15 @@ function createBlobSnapshotStore(): SnapshotStore {
         await createLock();
       } catch (error) {
         const existing = await readLockJson(pathname, token);
-        if (!existing) throw error;
+        if (!existing) {
+          await del(pathname, { token }).catch(() => undefined);
+          try {
+            await createLock();
+          } catch {
+            return undefined;
+          }
+          return lockHandle(name, pathname, token, owner);
+        }
         if (new Date(existing.expiresAt).getTime() > Date.now()) return undefined;
         await del(pathname, { token }).catch(() => undefined);
         try {
@@ -137,14 +145,23 @@ function createBlobSnapshotStore(): SnapshotStore {
         }
       }
 
-      return {
-        name,
-        async release() {
-          const current = await readLockJson(pathname, token).catch(() => undefined);
-          if (current?.owner !== owner) return;
-          await del(pathname, { token }).catch(() => undefined);
-        }
-      };
+      return lockHandle(name, pathname, token, owner);
+    }
+  };
+}
+
+function lockHandle(
+  name: string,
+  pathname: string,
+  token: string,
+  owner: string
+): SnapshotLock {
+  return {
+    name,
+    async release() {
+      const current = await readLockJson(pathname, token).catch(() => undefined);
+      if (current?.owner !== owner) return;
+      await del(pathname, { token }).catch(() => undefined);
     }
   };
 }

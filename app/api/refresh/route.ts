@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { isAuthorizedAdminRequest } from "@/lib/auth";
 import { readSnapshot, writeSnapshot } from "@/lib/cache";
 import { refreshOptionsSignature, refreshSnapshot } from "@/lib/compare";
+import { resolveCompareLanguages } from "@/lib/languages";
 import { acquireSnapshotLock } from "@/lib/snapshot-store";
 
 export const runtime = "nodejs";
@@ -12,7 +13,13 @@ export const maxDuration = 120;
 declare global {
   // eslint-disable-next-line no-var
   var __PEOPLEDIFF_REFRESH_INFLIGHT__:
-    | Map<string, Promise<Awaited<ReturnType<typeof refreshSnapshot>>>>
+    | Map<
+        string,
+        {
+          signature: string;
+          promise: Promise<Awaited<ReturnType<typeof refreshSnapshot>>>;
+        }
+      >
     | undefined;
 }
 
@@ -77,6 +84,10 @@ export async function POST(request: Request) {
       numberValue(firstValue(body.cacheTtlSeconds, searchParams.get("cacheTtlSeconds"))) ?? 900;
     const forceRefresh = booleanValue(firstValue(body.forceRefresh, searchParams.get("forceRefresh")));
     const signature = refreshOptionsSignature(refreshOptions);
+    const outputLockKey = refreshOutputLockKey(
+      refreshOptions.sourceLanguage,
+      refreshOptions.targetLanguage
+    );
 
     if (!forceRefresh && cacheTtlSeconds > 0) {
       const cached = await readSnapshot(undefined, {
@@ -93,9 +104,23 @@ export async function POST(request: Request) {
     }
 
     const inFlight = refreshInFlight();
-    const running = inFlight.get(signature);
+    const running = inFlight.get(outputLockKey);
     if (running) {
-      const snapshot = await running;
+      if (running.signature !== signature) {
+        return NextResponse.json(
+          {
+            error: "Refresh already running for this language pair",
+            refreshSignature: signature
+          },
+          {
+            status: 409,
+            headers: {
+              "x-peoplediff-cache": "inflight"
+            }
+          }
+        );
+      }
+      const snapshot = await running.promise;
       return NextResponse.json(snapshot, {
         headers: {
           "x-peoplediff-cache": "inflight"
@@ -103,7 +128,7 @@ export async function POST(request: Request) {
       });
     }
 
-    const lock = await acquireSnapshotLock(refreshLockName(signature), refreshLockTtlMs());
+    const lock = await acquireSnapshotLock(refreshLockName(outputLockKey), refreshLockTtlMs());
     if (!lock) {
       return NextResponse.json(
         { error: "Refresh already running", refreshSignature: signature },
@@ -119,10 +144,10 @@ export async function POST(request: Request) {
     const refreshTask = refreshSnapshot(refreshOptions)
       .then((snapshot) => writeSnapshot(snapshot))
       .finally(() => {
-        inFlight.delete(signature);
+        inFlight.delete(outputLockKey);
         void lock.release();
       });
-    inFlight.set(signature, refreshTask);
+    inFlight.set(outputLockKey, { signature, promise: refreshTask });
     const archivedSnapshot = await refreshTask;
     return NextResponse.json(archivedSnapshot, {
       headers: {
@@ -196,6 +221,11 @@ function refreshInFlight() {
 
 function refreshLockName(signature: string) {
   return createHash("sha256").update(signature).digest("hex").slice(0, 32);
+}
+
+function refreshOutputLockKey(sourceLanguage: unknown, targetLanguage: unknown) {
+  const selection = resolveCompareLanguages({ sourceLanguage, targetLanguage });
+  return `${selection.sourceLanguage}-${selection.targetLanguage}`;
 }
 
 function refreshLockTtlMs() {

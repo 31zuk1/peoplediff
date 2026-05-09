@@ -76,6 +76,15 @@ CRON_SECRET=change-me-too
 
 # Optional. Comma/space-separated cron target languages. Defaults to JP.
 PEOPLEDIFF_CRON_TARGETS=JP,EN
+
+# Optional. Refresh/OpenAI/scrape limits
+PEOPLEDIFF_AI_ARTICLE_LIMIT=80
+PEOPLEDIFF_AI_CONCURRENCY=6
+PEOPLEDIFF_SCRAPE_CONCURRENCY=16
+PEOPLEDIFF_CRON_MAX_PAGES=8
+PEOPLEDIFF_CRON_MAX_ARTICLES=240
+PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT=80
+PEOPLEDIFF_REFRESH_LOCK_TTL_SECONDS=600
 ```
 
 起動:
@@ -87,6 +96,8 @@ npm run dev
 ブラウザで `http://localhost:3000` を開き、`最新記事を更新` を押してください。
 
 ライブ更新では日付範囲を指定できます。UIでは中国語版と対象言語版の両方を同じ期間で取得・表示します。
+
+本番UIは読み取り専用です。ブラウザからの更新ボタンはローカル開発時だけ表示されます。本番更新は `Authorization: Bearer <token>` 付きの管理API、またはVercel Cronで実行してください。
 
 ## Commands
 
@@ -165,6 +176,10 @@ curl "http://localhost:3000/api/refresh?date=2026-05-07&targetLanguage=EN"
 
 無認証または不正なトークンのPOSTは、スクレイピングやOpenAI処理を開始する前に `401` を返します。公開画面や外部利用は `GET /api/refresh` の読み取りに限定し、重い更新処理はこのPOSTまたはcronに寄せます。
 
+ローカル開発時の `npm run dev` では、`PEOPLEDIFF_ADMIN_TOKEN` が未設定の場合だけ更新ボタンとPOSTが使えます。`npm run start` や本番環境では、Vercel以外で動かす場合も管理トークンなしのPOSTは拒否されます。
+
+公開UIは管理トークンをブラウザへ渡さない設計です。デプロイ直後にBlobへスナップショットがない場合、画面は `No snapshot` になります。公開前に認証付きPOSTまたはcronで初回snapshotをseedしてください。
+
 例:
 
 ```bash
@@ -239,11 +254,49 @@ Vercelにデプロイできます。
    - `PEOPLEDIFF_ADMIN_TOKEN`
    - `CRON_SECRET`
    - optional: `PEOPLEDIFF_CRON_TARGETS`
-   - optional: `PEOPLEDIFF_STORAGE=blob`
-   - optional: `BLOB_READ_WRITE_TOKEN`
+   - optional: `PEOPLEDIFF_AI_ARTICLE_LIMIT`
+   - optional: `PEOPLEDIFF_AI_CONCURRENCY`
+   - optional: `PEOPLEDIFF_SCRAPE_CONCURRENCY`
+   - optional: `PEOPLEDIFF_CRON_MAX_PAGES`
+   - optional: `PEOPLEDIFF_CRON_MAX_ARTICLES`
+   - optional: `PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT`
+   - optional: `PEOPLEDIFF_REFRESH_LOCK_TTL_SECONDS`
+   - `PEOPLEDIFF_STORAGE=blob`
+   - `BLOB_READ_WRITE_TOKEN`
 4. Deploy
+5. 公開前に認証付きPOSTまたはcronで初回snapshotをseed
 
-重要: Vercel serverlessの実行時ファイルシステムは永続ではありません。本番で履歴を残す場合は、Vercel Blob storeを作成し、`BLOB_READ_WRITE_TOKEN` を環境変数に設定してください。`PEOPLEDIFF_STORAGE=blob` を併用すると、トークン未設定時に明示的に失敗します。Blobを使わないローカル/永続ディスク環境では、従来通り `data/snapshots` または `PEOPLEDIFF_DATA_DIR` に保存されます。
+重要: Vercel serverlessの実行時ファイルシステムは永続ではありません。デモ公開でも履歴を保持するなら、Vercel Blob storeを作成し、`BLOB_READ_WRITE_TOKEN` と `PEOPLEDIFF_STORAGE=blob` を設定してください。`PEOPLEDIFF_STORAGE=blob` を併用すると、トークン未設定時に明示的に失敗します。Blobを使わないローカル/永続ディスク環境では、従来通り `data/snapshots` または `PEOPLEDIFF_DATA_DIR` に保存されます。
+
+### Release Smoke Test
+
+Preview deploymentで最低限次を確認してください。
+
+```bash
+curl -i "https://<preview-host>/api/refresh?targetLanguage=JP"
+curl -i -X POST "https://<preview-host>/api/refresh" \
+  -H "content-type: application/json" \
+  -d '{"targetLanguage":"JP"}'
+curl -i -X POST "https://<preview-host>/api/refresh" \
+  -H "authorization: Bearer $PEOPLEDIFF_ADMIN_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"targetLanguage":"JP","dates":["YYYY-MM-DD"],"maxPages":2,"maxArticles":40,"aiArticleLimit":8}'
+curl -i "https://<preview-host>/api/cron/refresh" \
+  -H "authorization: Bearer $CRON_SECRET"
+```
+
+期待値:
+
+- 公開GETは `200`
+- 無認証POSTは `401`
+- 認証付きPOSTは `200`
+- secret付きcronは `200`
+- 公開UIに更新ボタンが出ない
+- `run.storageBackend` が `blob`
+- Blobに `latest.json`、日付snapshot、`index.json` が作成される
+- 日付指定GETで保存済みsnapshotが読める
+
+cronは対象言語を順次更新します。`PEOPLEDIFF_CRON_TARGETS` を増やす場合は、`maxDuration=300` に収まるように `PEOPLEDIFF_CRON_MAX_PAGES`、`PEOPLEDIFF_CRON_MAX_ARTICLES`、`PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT` を小さめに始めてください。
 
 ## Current Limitations
 
@@ -253,6 +306,7 @@ Vercelにデプロイできます。
 - OpenAI翻訳は既定では取得記事の先頭範囲に上限を設けます。必要に応じて `aiArticleLimit` または `PEOPLEDIFF_AI_ARTICLE_LIMIT` で調整できます。
 - 日付はURL日付と本文日付の両方を持ちます。ズレた場合は `dateMismatch` として保持します。
 - ファイルベースの履歴保存はPoC向けです。
+- 言語カバレッジは人民網の公開導線をもとにした実装です。README上の外語チャンネル確認日は2025年4月時点であり、公開前に最新版を再確認する余地があります。
 
 ## Design Intent
 

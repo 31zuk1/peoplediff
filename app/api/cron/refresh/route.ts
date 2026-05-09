@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { createHash } from "node:crypto";
 import { isAuthorizedBearer } from "@/lib/auth";
 import { writeSnapshot } from "@/lib/cache";
-import { refreshOptionsSignature, refreshSnapshot } from "@/lib/compare";
+import { refreshSnapshot } from "@/lib/compare";
 import { DEFAULT_TARGET_LANGUAGE, TARGET_LANGUAGE_CODES } from "@/lib/languages";
 import { acquireSnapshotLock } from "@/lib/snapshot-store";
 
@@ -42,8 +42,7 @@ export async function GET(request: Request) {
       maxArticles: numberFromEnv("PEOPLEDIFF_CRON_MAX_ARTICLES"),
       aiArticleLimit: numberFromEnv("PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT")
     };
-    const signature = refreshOptionsSignature(refreshOptions);
-    const lock = await acquireSnapshotLock(refreshLockName(signature), refreshLockTtlMs());
+    const lock = await acquireSnapshotLock(refreshLockName(`CN-${targetLanguage}`), refreshLockTtlMs());
     if (!lock) {
       results.push({
         targetLanguage,

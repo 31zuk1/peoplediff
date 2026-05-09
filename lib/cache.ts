@@ -25,6 +25,12 @@ type SnapshotReadOptions = {
   target?: unknown;
 };
 
+type SnapshotIndex = {
+  updatedAt?: string;
+  comparisonKey?: string;
+  dates?: string[];
+};
+
 export async function readSnapshot(date?: string, options: SnapshotReadOptions = {}) {
   const languageSelection = resolveCompareLanguages(options);
   const key = comparisonKey(languageSelection.sourceLanguage, languageSelection.targetLanguage);
@@ -85,7 +91,7 @@ export async function writeSnapshot(snapshot: RefreshResult) {
     )
   );
   await store.writeJson(latestFileName(key), storedSnapshot);
-  await writeIndex(store, key);
+  await writeIndex(store, key, [...dailySnapshots.keys()]);
 
   rememberSnapshot(storedSnapshot, key);
   globalThis.__PEOPLEDIFF_CACHE_BY_DATE__ = {
@@ -250,18 +256,33 @@ function articleDate(article?: Article) {
 }
 
 async function listArchiveDates(key = DEFAULT_COMPARISON_KEY) {
-  const names = await createSnapshotStore().listNames();
+  const store = createSnapshotStore();
+  const index = await store.readJson<SnapshotIndex>(indexFileName(key)).catch(() => undefined);
+  const indexDates = normalizeIndexDates(index, key);
+  if (indexDates.length) return indexDates;
+
+  const names = await store.listNames().catch(() => []);
   return [...new Set(names.map((file) => archiveDateFromFile(file, key)).filter(isDate))]
     .sort((a, b) => b.localeCompare(a));
 }
 
-async function writeIndex(store: ReturnType<typeof createSnapshotStore>, key = DEFAULT_COMPARISON_KEY) {
-  const dates = await listArchiveDates(key);
+async function writeIndex(
+  store: ReturnType<typeof createSnapshotStore>,
+  key = DEFAULT_COMPARISON_KEY,
+  newDates: string[] = []
+) {
+  const dates = [...new Set([...newDates, ...(await listArchiveDates(key))].filter(isDate))]
+    .sort((a, b) => b.localeCompare(a));
   await store.writeJson(indexFileName(key), {
     updatedAt: new Date().toISOString(),
     comparisonKey: key,
     dates
   });
+}
+
+function normalizeIndexDates(index: SnapshotIndex | undefined, key: string) {
+  if (!index || index.comparisonKey !== key || !Array.isArray(index.dates)) return [];
+  return [...new Set(index.dates.filter(isDate))].sort((a, b) => b.localeCompare(a));
 }
 
 function stripArchiveMetadata(snapshot: RefreshResult): RefreshResult {

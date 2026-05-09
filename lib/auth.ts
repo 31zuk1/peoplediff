@@ -11,8 +11,16 @@ export function isAuthorizedBearer(request: Request, expectedToken: string | und
 }
 
 export function isAuthorizedAdminRequest(request: Request) {
-  if (!process.env.VERCEL && !process.env.PEOPLEDIFF_ADMIN_TOKEN) return true;
+  if (isLocalDevelopmentWithoutAdminToken()) return true;
   return isAuthorizedBearer(request, process.env.PEOPLEDIFF_ADMIN_TOKEN);
+}
+
+export function isLocalDevelopmentWithoutAdminToken() {
+  return (
+    process.env.NODE_ENV !== "production" &&
+    !process.env.VERCEL &&
+    !process.env.PEOPLEDIFF_ADMIN_TOKEN
+  );
 }
 
 export function bearerToken(request: Request) {
