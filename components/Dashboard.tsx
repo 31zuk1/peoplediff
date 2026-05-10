@@ -109,12 +109,10 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
   }, [data.targetLanguage]);
 
   useEffect(() => {
-    const nextRange = dateRangeFromScope(
-      data.targetDateScope?.length ? data.targetDateScope : data.dateScope
-    );
+    const nextRange = dateRangeFromScope(data.dateScope);
     setDateFrom(nextRange.from);
     setDateTo(nextRange.to);
-  }, [data.dateScope, data.generatedAt, data.targetDateScope]);
+  }, [data.dateScope, data.generatedAt]);
 
   const filteredPairs = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -288,7 +286,7 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
               </span>
               {data.dateScope?.length ? (
                 <span className="rounded border border-emerald-200/20 bg-emerald-300/10 px-2.5 py-1 text-emerald-100/80">
-                  対象期間 {formatScopeRange(data.targetDateScope?.length ? data.targetDateScope : data.dateScope)}
+                  対象期間 {formatScopeRange(data.dateScope)}
                 </span>
               ) : null}
               {data.run ? (
@@ -1126,9 +1124,7 @@ function findClientSnapshot(
 }
 
 function snapshotDates(snapshot: RefreshResult) {
-  return normalizeDateList(
-    snapshot.targetDateScope?.length ? snapshot.targetDateScope : snapshot.dateScope
-  );
+  return normalizeDateList(snapshot.dateScope);
 }
 
 function snapshotScopeLabel(snapshot: RefreshResult, archiveDate: string) {
