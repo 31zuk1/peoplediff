@@ -198,10 +198,16 @@ function splitSnapshotByDate(snapshot: RefreshResult) {
 function collectSnapshotDates(snapshot: RefreshResult) {
   const values = new Set<string>();
 
-  snapshot.dateScope?.forEach((date) => {
+  const scopedDates = snapshot.targetDateScope?.length
+    ? snapshot.targetDateScope
+    : snapshot.dateScope;
+
+  scopedDates?.forEach((date) => {
     const normalized = normalizeArchiveDate(date);
     if (normalized) values.add(normalized);
   });
+
+  if (values.size) return [...values].sort((a, b) => b.localeCompare(a));
 
   [
     ...(snapshot.baseArticles ?? snapshot.cnArticles),
