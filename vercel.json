@@ -1,8 +1,32 @@
 {
   "crons": [
     {
-      "path": "/api/cron/refresh",
+      "path": "/api/cron/refresh/0",
       "schedule": "5 16 * * *"
+    },
+    {
+      "path": "/api/cron/refresh/1",
+      "schedule": "5 18 * * *"
+    },
+    {
+      "path": "/api/cron/refresh/2",
+      "schedule": "5 20 * * *"
+    },
+    {
+      "path": "/api/cron/refresh/3",
+      "schedule": "5 22 * * *"
+    },
+    {
+      "path": "/api/cron/refresh/4",
+      "schedule": "5 0 * * *"
+    },
+    {
+      "path": "/api/cron/refresh/5",
+      "schedule": "5 2 * * *"
+    },
+    {
+      "path": "/api/cron/refresh/6",
+      "schedule": "5 4 * * *"
     }
   ]
 }

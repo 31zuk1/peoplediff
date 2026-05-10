@@ -79,11 +79,15 @@ PEOPLEDIFF_CRON_TARGETS=JP,EN
 
 # Optional. Refresh/OpenAI/scrape limits
 PEOPLEDIFF_AI_ARTICLE_LIMIT=80
+PEOPLEDIFF_READ_WINDOW_DAYS=7
 PEOPLEDIFF_AI_CONCURRENCY=6
 PEOPLEDIFF_SCRAPE_CONCURRENCY=16
 PEOPLEDIFF_CRON_MAX_PAGES=8
 PEOPLEDIFF_CRON_MAX_ARTICLES=240
 PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT=80
+PEOPLEDIFF_CRON_SOURCE_LOOKBACK_DAYS=3
+PEOPLEDIFF_CRON_ROLLING_DAYS=7
+PEOPLEDIFF_CRON_LATEST_OFFSET=0
 PEOPLEDIFF_REFRESH_LOCK_TTL_SECONDS=600
 ```
 
@@ -208,14 +212,14 @@ curl -X POST "http://localhost:3000/api/refresh" \
 
 ### `GET /api/cron/refresh`
 
-Vercel Cron向けの更新APIです。`CRON_SECRET` を `Authorization: Bearer <secret>` で受け取り、`PEOPLEDIFF_CRON_TARGETS` に指定した対象言語を、JST基準の今日/昨日で更新します。
+Vercel Cron向けの更新APIです。`CRON_SECRET` を `Authorization: Bearer <secret>` で受け取り、`PEOPLEDIFF_CRON_TARGETS` に指定した対象言語を更新します。
 
 ```bash
 curl "http://localhost:3000/api/cron/refresh" \
   -H "Authorization: Bearer $CRON_SECRET"
 ```
 
-cronの既定スケジュールは `vercel.json` の `5 16 * * *` です。これはUTC指定なので、日本時間では毎日01:05に実行されます。
+本番では `vercel.json` に `/api/cron/refresh/0` から `/api/cron/refresh/6` まで7本のcronを登録しています。各ジョブはJST基準の今日から6日前までを1日ずつ更新し、公開GETは保存済み日別snapshotの直近7日分をマージして返します。7日分を1回でスクレイプするとVercelの関数時間上限に当たりやすいため、意図的に日別分割しています。
 
 ## Project Structure
 
@@ -260,6 +264,10 @@ Vercelにデプロイできます。
    - optional: `PEOPLEDIFF_CRON_MAX_PAGES`
    - optional: `PEOPLEDIFF_CRON_MAX_ARTICLES`
    - optional: `PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT`
+   - optional: `PEOPLEDIFF_CRON_SOURCE_LOOKBACK_DAYS`
+   - optional: `PEOPLEDIFF_CRON_ROLLING_DAYS`
+   - optional: `PEOPLEDIFF_CRON_LATEST_OFFSET`
+   - optional: `PEOPLEDIFF_READ_WINDOW_DAYS`
    - optional: `PEOPLEDIFF_REFRESH_LOCK_TTL_SECONDS`
    - `PEOPLEDIFF_STORAGE=blob`
    - `BLOB_READ_WRITE_TOKEN`
@@ -296,7 +304,7 @@ curl -i "https://<preview-host>/api/cron/refresh" \
 - Blobに `latest.json`、日付snapshot、`index.json` が作成される
 - 日付指定GETで保存済みsnapshotが読める
 
-cronは対象言語を順次更新します。`PEOPLEDIFF_CRON_TARGETS` を増やす場合は、`maxDuration=300` に収まるように `PEOPLEDIFF_CRON_MAX_PAGES`、`PEOPLEDIFF_CRON_MAX_ARTICLES`、`PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT` を小さめに始めてください。
+cronは日別に分割して対象言語を順次更新します。`PEOPLEDIFF_CRON_TARGETS` を増やす場合は、各日別ジョブが `maxDuration=300` に収まるように `PEOPLEDIFF_CRON_MAX_PAGES`、`PEOPLEDIFF_CRON_MAX_ARTICLES`、`PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT` を小さめに始めてください。Vercel Hobbyではcronごとの実行は1日1回までですが、プロジェクトあたり100 cron jobsまで使えるため、7本の日別cronでローリング1週間を維持します。
 
 ## Current Limitations
 

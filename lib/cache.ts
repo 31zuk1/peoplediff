@@ -1,5 +1,5 @@
 import type { Source } from "./types";
-import type { Article, ArticlePair, RefreshResult } from "./types";
+import type { Article, ArticlePair, RefreshResult, RefreshRunMetadata } from "./types";
 import { calculateStats, emptySnapshot } from "./compare";
 import { getAvailableLanguageSummaries, resolveCompareLanguages } from "./languages";
 import { createSnapshotStore, snapshotStorageBackend, usesDurableSnapshotStore } from "./snapshot-store";
@@ -23,6 +23,13 @@ type SnapshotReadOptions = {
   targetLanguage?: unknown;
   source?: unknown;
   target?: unknown;
+  dateFrom?: unknown;
+  dateTo?: unknown;
+  windowDays?: unknown;
+};
+
+type SnapshotWriteOptions = {
+  updateLatest?: boolean;
 };
 
 type SnapshotIndex = {
@@ -36,6 +43,13 @@ export async function readSnapshot(date?: string, options: SnapshotReadOptions =
   const key = comparisonKey(languageSelection.sourceLanguage, languageSelection.targetLanguage);
   const normalizedDate = normalizeArchiveDate(date);
   if (normalizedDate) return readDatedSnapshot(normalizedDate, key);
+
+  const archiveDates = await listArchiveDates(key);
+  const windowDates = readWindowDates(archiveDates, options);
+  if (windowDates.length) {
+    const aggregate = await readAggregatedSnapshot(windowDates, key);
+    if (aggregate) return aggregate;
+  }
 
   const useMemoryCache = !usesDurableSnapshotStore();
   const cachedByKey = useMemoryCache ? globalThis.__PEOPLEDIFF_CACHE_BY_KEY__?.[key] : undefined;
@@ -53,7 +67,7 @@ export async function readSnapshot(date?: string, options: SnapshotReadOptions =
     return withArchiveDates(cleanSnapshot, undefined, key);
   }
 
-  const latestDate = (await listArchiveDates(key))[0];
+  const latestDate = archiveDates[0];
   if (latestDate) return readDatedSnapshot(latestDate, key);
 
   const legacy = key === DEFAULT_COMPARISON_KEY ? await store.readLegacyJson?.<RefreshResult>() : undefined;
@@ -73,7 +87,8 @@ export async function readSnapshot(date?: string, options: SnapshotReadOptions =
   );
 }
 
-export async function writeSnapshot(snapshot: RefreshResult) {
+export async function writeSnapshot(snapshot: RefreshResult, options: SnapshotWriteOptions = {}) {
+  const updateLatest = options.updateLatest ?? true;
   const cleanSnapshot = stripArchiveMetadata(snapshot);
   const storedSnapshot: RefreshResult = cleanSnapshot.run
     ? {
@@ -90,10 +105,14 @@ export async function writeSnapshot(snapshot: RefreshResult) {
       store.writeJson(datedFileName(date, key), dailySnapshot)
     )
   );
-  await store.writeJson(latestFileName(key), storedSnapshot);
+  if (updateLatest) {
+    await store.writeJson(latestFileName(key), storedSnapshot);
+  }
   await writeIndex(store, key, [...dailySnapshots.keys()]);
 
-  rememberSnapshot(storedSnapshot, key);
+  if (updateLatest) {
+    rememberSnapshot(storedSnapshot, key);
+  }
   globalThis.__PEOPLEDIFF_CACHE_BY_DATE__ = {
     ...(globalThis.__PEOPLEDIFF_CACHE_BY_DATE__ ?? {}),
     ...Object.fromEntries([...dailySnapshots].map(([date, daily]) => [datedCacheKey(date, key), daily]))
@@ -126,6 +145,22 @@ async function readDatedSnapshot(date: string, key = DEFAULT_COMPARISON_KEY) {
     dateScope: [date]
   };
   return withArchiveDates(empty, date, key);
+}
+
+async function readAggregatedSnapshot(dates: string[], key = DEFAULT_COMPARISON_KEY) {
+  const store = createSnapshotStore();
+  const snapshots = (
+    await Promise.all(
+      dates.map(async (date) => {
+        const archived = await store.readJson<RefreshResult>(datedFileName(date, key));
+        return archived ? stripArchiveMetadata(archived) : undefined;
+      })
+    )
+  ).filter((snapshot): snapshot is RefreshResult => Boolean(snapshot));
+
+  if (!snapshots.length) return undefined;
+
+  return withArchiveDates(aggregateSnapshots(snapshots, key), undefined, key);
 }
 
 async function withArchiveDates(
@@ -195,6 +230,42 @@ function splitSnapshotByDate(snapshot: RefreshResult) {
   return dailySnapshots;
 }
 
+function aggregateSnapshots(snapshots: RefreshResult[], key: string): RefreshResult {
+  const [fallbackBaseLanguage, fallbackTargetLanguage] = languagesFromKey(key);
+  const baseLanguage = snapshots[0].baseLanguage ?? fallbackBaseLanguage;
+  const targetLanguage = snapshots[0].targetLanguage ?? fallbackTargetLanguage;
+  const baseArticles = uniqueArticles(
+    snapshots.flatMap((snapshot) => snapshot.baseArticles ?? snapshot.cnArticles ?? [])
+  );
+  const targetArticles = uniqueArticles(
+    snapshots.flatMap((snapshot) => snapshot.targetArticles ?? snapshot.jpArticles ?? [])
+  );
+  const pairs = uniquePairs(snapshots.flatMap((snapshot) => snapshot.pairs));
+  const dateScope = uniqueDates(snapshots.flatMap((snapshot) => snapshot.dateScope ?? []));
+  const sourceDateScope = uniqueDates(snapshots.flatMap((snapshot) => snapshot.sourceDateScope ?? []));
+  const targetDateScope = uniqueDates(snapshots.flatMap((snapshot) => snapshot.targetDateScope ?? []));
+  const warnings = [...new Set(snapshots.flatMap((snapshot) => snapshot.warnings ?? []))];
+
+  return {
+    ...snapshots[0],
+    generatedAt: latestGeneratedAt(snapshots),
+    activeDate: undefined,
+    archiveDates: undefined,
+    dateScope,
+    sourceDateScope: sourceDateScope.length ? sourceDateScope : dateScope,
+    targetDateScope: targetDateScope.length ? targetDateScope : dateScope,
+    baseArticles,
+    targetArticles,
+    cnArticles: baseArticles,
+    jpArticles: targetLanguage === "JP" ? targetArticles : [],
+    pairs,
+    stats: calculateStats(pairs, baseArticles.length, targetArticles.length, baseLanguage, targetLanguage),
+    warnings,
+    run: aggregateRunMetadata(snapshots),
+    refreshSignature: undefined
+  };
+}
+
 function collectSnapshotDates(snapshot: RefreshResult) {
   const values = new Set<string>();
 
@@ -218,6 +289,51 @@ function collectSnapshotDates(snapshot: RefreshResult) {
   });
 
   return [...values].sort((a, b) => b.localeCompare(a));
+}
+
+function readWindowDates(archiveDates: string[], options: SnapshotReadOptions) {
+  const explicitRange = dateRange(
+    typeof options.dateFrom === "string" ? options.dateFrom : undefined,
+    typeof options.dateTo === "string" ? options.dateTo : undefined
+  );
+  if (explicitRange.length) {
+    const available = new Set(archiveDates);
+    return explicitRange.filter((date) => available.has(date));
+  }
+
+  return archiveDates.slice(0, readWindowDays(options.windowDays));
+}
+
+function readWindowDays(input: unknown) {
+  const configured =
+    typeof input === "number" || typeof input === "string"
+      ? Number(input)
+      : Number(process.env.PEOPLEDIFF_READ_WINDOW_DAYS);
+  if (!Number.isFinite(configured) || configured <= 0) return 7;
+  return Math.min(14, Math.max(1, Math.round(configured)));
+}
+
+function dateRange(fromInput: string | undefined, toInput: string | undefined) {
+  const from = normalizeArchiveDate(fromInput);
+  const to = normalizeArchiveDate(toInput);
+  if (!from && !to) return [];
+  const start = from && to ? (from <= to ? from : to) : (from ?? to);
+  const end = from && to ? (from <= to ? to : from) : (from ?? to);
+  if (!start || !end) return [];
+
+  const dates: string[] = [];
+  let cursor = start;
+  while (cursor <= end && dates.length < 31) {
+    dates.push(cursor);
+    cursor = addDays(cursor, 1);
+  }
+  return dates.sort((a, b) => b.localeCompare(a));
+}
+
+function addDays(date: string, offset: number) {
+  const value = new Date(`${date}T00:00:00.000Z`);
+  value.setUTCDate(value.getUTCDate() + offset);
+  return value.toISOString().slice(0, 10);
 }
 
 function collectArticlesForDate(
@@ -259,6 +375,79 @@ function pairTouchesDate(pair: ArticlePair, date: string) {
 
 function articleDate(article?: Article) {
   return article?.urlDate || article?.publishedDate;
+}
+
+function uniqueDates(dates: string[]) {
+  return [...new Set(dates.map(normalizeArchiveDate).filter(isDefinedDate))]
+    .sort((a, b) => b.localeCompare(a));
+}
+
+function uniqueArticles(articles: Article[]) {
+  return [...new Map(articles.map((article) => [article.id, article])).values()];
+}
+
+function uniquePairs(pairs: ArticlePair[]) {
+  return [...new Map(pairs.map((pair) => [pair.id, pair])).values()];
+}
+
+function latestGeneratedAt(snapshots: RefreshResult[]) {
+  return snapshots
+    .map((snapshot) => snapshot.generatedAt)
+    .filter(Boolean)
+    .sort((a, b) => b.localeCompare(a))[0] ?? new Date().toISOString();
+}
+
+function aggregateRunMetadata(snapshots: RefreshResult[]): RefreshRunMetadata | undefined {
+  const runs = snapshots.map((snapshot) => snapshot.run).filter((run): run is RefreshRunMetadata => Boolean(run));
+  if (!runs.length) return undefined;
+
+  const modelUsage = new Map<string, {
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    estimatedCostUsd: number;
+  }>();
+
+  runs.forEach((run) => {
+    run.openaiModelUsage?.forEach((usage) => {
+      const existing = modelUsage.get(usage.model) ?? {
+        calls: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        estimatedCostUsd: 0
+      };
+      modelUsage.set(usage.model, {
+        calls: existing.calls + usage.calls,
+        inputTokens: existing.inputTokens + usage.inputTokens,
+        outputTokens: existing.outputTokens + usage.outputTokens,
+        estimatedCostUsd: Number((existing.estimatedCostUsd + usage.estimatedCostUsd).toFixed(6))
+      });
+    });
+  });
+
+  return {
+    runId: `aggregate:${runs[0].runId}`,
+    durationMs: runs.reduce((sum, run) => sum + run.durationMs, 0),
+    warningCount: runs.reduce((sum, run) => sum + run.warningCount, 0),
+    openaiCalls: runs.reduce((sum, run) => sum + run.openaiCalls, 0),
+    openaiInputTokens: runs.reduce((sum, run) => sum + run.openaiInputTokens, 0),
+    openaiOutputTokens: runs.reduce((sum, run) => sum + run.openaiOutputTokens, 0),
+    openaiModelUsage: [...modelUsage.entries()].map(([model, usage]) => ({
+      model,
+      calls: usage.calls,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      estimatedCostUsd: usage.estimatedCostUsd
+    })),
+    estimatedOpenAiCostUsd: Number(
+      runs.reduce((sum, run) => sum + run.estimatedOpenAiCostUsd, 0).toFixed(6)
+    ),
+    storageBackend: runs[0].storageBackend
+  };
+}
+
+function isDefinedDate(date: string | undefined): date is string {
+  return Boolean(date);
 }
 
 async function listArchiveDates(key = DEFAULT_COMPARISON_KEY) {

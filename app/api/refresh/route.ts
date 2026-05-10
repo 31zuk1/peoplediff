@@ -28,7 +28,10 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const snapshot = await readSnapshot(searchParams.get("date") ?? undefined, {
       sourceLanguage: searchParams.get("sourceLanguage") ?? searchParams.get("source"),
-      targetLanguage: searchParams.get("targetLanguage") ?? searchParams.get("target")
+      targetLanguage: searchParams.get("targetLanguage") ?? searchParams.get("target"),
+      dateFrom: searchParams.get("dateFrom") ?? undefined,
+      dateTo: searchParams.get("dateTo") ?? undefined,
+      windowDays: searchParams.get("windowDays") ?? undefined
     });
     return NextResponse.json(snapshot);
   } catch (error) {
