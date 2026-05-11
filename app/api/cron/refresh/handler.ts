@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { isAuthorizedBearer } from "@/lib/auth";
 import { writeSnapshot } from "@/lib/cache";
 import { refreshSnapshot } from "@/lib/compare";
+import { refreshJapaneseMajorSnapshot } from "@/lib/jp-major";
 import { DEFAULT_TARGET_LANGUAGE, TARGET_LANGUAGE_CODES } from "@/lib/languages";
 import { acquireSnapshotLock } from "@/lib/snapshot-store";
 
@@ -15,38 +16,45 @@ export async function handleCronRefresh(request: Request, offsetInput?: unknown)
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const targetPlan = cronTargets(process.env.PEOPLEDIFF_CRON_TARGETS);
+  const { searchParams } = new URL(request.url);
+  const mode = cronCollectionMode(searchParams.get("mode"));
+  const configuredTargetPlan = cronTargets(process.env.PEOPLEDIFF_CRON_TARGETS);
+  const ignoredTargets =
+    mode === "jp-major"
+      ? configuredTargetPlan.targets.filter((target) => target !== "JP")
+      : [];
+  const targetPlan =
+    mode === "jp-major"
+      ? {
+          targets: ["JP" as TargetLanguage],
+          invalidTargets: configuredTargetPlan.invalidTargets,
+          ignoredTargets
+        }
+      : { ...configuredTargetPlan, ignoredTargets: [] as TargetLanguage[] };
+
   if (!targetPlan.targets.length) {
     return NextResponse.json(
       {
         error: "No valid cron targets configured",
-        invalidTargets: targetPlan.invalidTargets
+        invalidTargets: targetPlan.invalidTargets,
+        collectionMode: mode
       },
       { status: 400 }
     );
   }
 
-  const { searchParams } = new URL(request.url);
   const offset = rollingOffset(offsetInput ?? searchParams.get("offset"));
   const targetDate = dateInJst(offset);
   const updateLatest = offset === latestOffset();
   const results = [];
 
   for (const targetLanguage of targetPlan.targets) {
-    const refreshOptions = {
-      targetLanguage,
-      dates: [targetDate],
-      targetDates: [targetDate],
-      sourceLookbackDays: numberFromEnv("PEOPLEDIFF_CRON_SOURCE_LOOKBACK_DAYS") ?? 3,
-      limit: numberFromEnv("PEOPLEDIFF_CRON_LIMIT"),
-      maxPages: numberFromEnv("PEOPLEDIFF_CRON_MAX_PAGES"),
-      maxArticles: numberFromEnv("PEOPLEDIFF_CRON_MAX_ARTICLES"),
-      aiArticleLimit: numberFromEnv("PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT")
-    };
-    const lock = await acquireSnapshotLock(refreshLockName(`CN-${targetLanguage}`), refreshLockTtlMs());
+    const lockKey = mode === "jp-major" ? "jp-major.CN-JP" : `broad:CN-${targetLanguage}`;
+    const lock = await acquireSnapshotLock(refreshLockName(lockKey), refreshLockTtlMs());
     if (!lock) {
       results.push({
         targetLanguage,
+        collectionMode: mode,
         ok: false,
         locked: true,
         error: "Refresh already running"
@@ -55,10 +63,38 @@ export async function handleCronRefresh(request: Request, offsetInput?: unknown)
     }
 
     try {
-      const snapshot = await refreshSnapshot(refreshOptions);
+      const snapshot =
+        mode === "jp-major"
+          ? await refreshJapaneseMajorSnapshot({
+              dates: [targetDate],
+              maxPages:
+                numberFromEnv("PEOPLEDIFF_JP_MAJOR_MAX_PAGES") ??
+                numberFromEnv("PEOPLEDIFF_CRON_MAX_PAGES"),
+              maxArticles:
+                numberFromEnv("PEOPLEDIFF_JP_MAJOR_MAX_ARTICLES") ??
+                numberFromEnv("PEOPLEDIFF_CRON_MAX_ARTICLES"),
+              aiArticleLimit:
+                numberFromEnv("PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT", { allowZero: true }) ??
+                numberFromEnv("PEOPLEDIFF_AI_ARTICLE_LIMIT", { allowZero: true }),
+              maxQueries: numberFromEnv("PEOPLEDIFF_JP_MAJOR_SEARCH_QUERIES"),
+              candidatesPerQuery: numberFromEnv("PEOPLEDIFF_JP_MAJOR_CANDIDATES_PER_QUERY")
+            })
+          : await refreshSnapshot({
+              targetLanguage,
+              dates: [targetDate],
+              targetDates: [targetDate],
+              sourceLookbackDays: numberFromEnv("PEOPLEDIFF_CRON_SOURCE_LOOKBACK_DAYS") ?? 3,
+              limit: numberFromEnv("PEOPLEDIFF_CRON_LIMIT"),
+              maxPages: numberFromEnv("PEOPLEDIFF_CRON_MAX_PAGES"),
+              maxArticles: numberFromEnv("PEOPLEDIFF_CRON_MAX_ARTICLES"),
+              aiArticleLimit: numberFromEnv("PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT", {
+                allowZero: true
+              })
+            });
       const archived = await writeSnapshot(snapshot, { updateLatest });
       results.push({
         targetLanguage,
+        collectionMode: mode,
         ok: true,
         generatedAt: archived.generatedAt,
         archiveDates: archived.archiveDates,
@@ -68,6 +104,7 @@ export async function handleCronRefresh(request: Request, offsetInput?: unknown)
     } catch (error) {
       results.push({
         targetLanguage,
+        collectionMode: mode,
         ok: false,
         error: errorMessage(error)
       });
@@ -81,15 +118,23 @@ export async function handleCronRefresh(request: Request, offsetInput?: unknown)
     {
       refreshedAt: new Date().toISOString(),
       timeZone: JST_TIME_ZONE,
+      collectionMode: mode,
       rollingDayOffset: offset,
       targetDate,
       updateLatest,
       targets: targetPlan.targets,
       invalidTargets: targetPlan.invalidTargets,
+      ignoredTargets: targetPlan.ignoredTargets,
       results
     },
     { status: hasFailure ? 500 : 200 }
   );
+}
+
+function cronCollectionMode(input: string | null): "broad" | "jp-major" {
+  const configured = input ?? process.env.PEOPLEDIFF_CRON_MODE ?? process.env.PEOPLEDIFF_DEFAULT_MODE;
+  if (!configured) return "jp-major";
+  return /^(broad|legacy|wide)$/i.test(configured) ? "broad" : "jp-major";
 }
 
 function cronTargets(input: string | undefined) {
@@ -156,11 +201,12 @@ function addDays(date: string, days: number) {
   return value.toISOString().slice(0, 10);
 }
 
-function numberFromEnv(name: string) {
+function numberFromEnv(name: string, options: { allowZero?: boolean } = {}) {
   const raw = process.env[name];
   if (!raw) return undefined;
   const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+  const minimum = options.allowZero ? 0 : 1;
+  return Number.isFinite(value) && value >= minimum ? Math.round(value) : undefined;
 }
 
 function errorMessage(error: unknown) {

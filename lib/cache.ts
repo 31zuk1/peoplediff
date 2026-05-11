@@ -1,5 +1,11 @@
 import type { Source } from "./types";
-import type { Article, ArticlePair, RefreshResult, RefreshRunMetadata } from "./types";
+import type {
+  AnchoredArticlePair,
+  Article,
+  ArticlePair,
+  RefreshResult,
+  RefreshRunMetadata
+} from "./types";
 import { calculateStats, emptySnapshot } from "./compare";
 import { getAvailableLanguageSummaries, resolveCompareLanguages } from "./languages";
 import { createSnapshotStore, snapshotStorageBackend, usesDurableSnapshotStore } from "./snapshot-store";
@@ -23,6 +29,8 @@ type SnapshotReadOptions = {
   targetLanguage?: unknown;
   source?: unknown;
   target?: unknown;
+  mode?: unknown;
+  collectionMode?: unknown;
   dateFrom?: unknown;
   dateTo?: unknown;
   windowDays?: unknown;
@@ -40,7 +48,11 @@ type SnapshotIndex = {
 
 export async function readSnapshot(date?: string, options: SnapshotReadOptions = {}) {
   const languageSelection = resolveCompareLanguages(options);
-  const key = comparisonKey(languageSelection.sourceLanguage, languageSelection.targetLanguage);
+  const key = comparisonKey(
+    languageSelection.sourceLanguage,
+    languageSelection.targetLanguage,
+    snapshotCollectionMode(options)
+  );
   const normalizedDate = normalizeArchiveDate(date);
   if (normalizedDate) return readDatedSnapshot(normalizedDate, key);
 
@@ -79,6 +91,7 @@ export async function readSnapshot(date?: string, options: SnapshotReadOptions =
   return withArchiveDates(
     {
       ...emptySnapshot(),
+      collectionMode: collectionModeFromKey(key),
       baseLanguage: languageSelection.sourceLanguage,
       targetLanguage: languageSelection.targetLanguage
     },
@@ -140,6 +153,7 @@ async function readDatedSnapshot(date: string, key = DEFAULT_COMPARISON_KEY) {
   const [baseLanguage, targetLanguage] = languagesFromKey(key);
   const empty = {
     ...emptySnapshot(),
+    collectionMode: collectionModeFromKey(key),
     baseLanguage,
     targetLanguage,
     dateScope: [date]
@@ -177,6 +191,7 @@ async function withArchiveDates(
   return {
     ...snapshot,
     schemaVersion: snapshot.schemaVersion ?? 1,
+    collectionMode: snapshot.collectionMode ?? collectionModeFromKey(key),
     baseLanguage,
     targetLanguage,
     availableLanguages: snapshot.availableLanguages ?? getAvailableLanguageSummaries(),
@@ -201,6 +216,7 @@ function splitSnapshotByDate(snapshot: RefreshResult) {
 
   for (const date of dates) {
     const pairs = snapshot.pairs.filter((pair) => pairTouchesDate(pair, date));
+    const anchoredPairs = snapshot.anchoredPairs?.filter((pair) => anchoredPairTouchesDate(pair, date)) ?? [];
     const baseArticles = collectArticlesForDate(baseSource, pairs, "base", date);
     const targetArticles = collectArticlesForDate(targetSource, pairs, "target", date);
 
@@ -217,13 +233,17 @@ function splitSnapshotByDate(snapshot: RefreshResult) {
       cnArticles: baseArticles,
       jpArticles: snapshot.targetLanguage === "JP" ? targetArticles : [],
       pairs,
-      stats: calculateStats(
-        pairs,
-        baseArticles.length,
-        targetArticles.length,
-        snapshot.baseLanguage ?? "CN",
-        snapshot.targetLanguage ?? "JP"
-      )
+      anchoredPairs: anchoredPairs.length ? anchoredPairs : undefined,
+      stats:
+        snapshot.collectionMode === "jp-major" && anchoredPairs.length
+          ? calculateAnchoredAggregateStats(anchoredPairs)
+          : calculateStats(
+              pairs,
+              baseArticles.length,
+              targetArticles.length,
+              snapshot.baseLanguage ?? "CN",
+              snapshot.targetLanguage ?? "JP"
+            )
     });
   }
 
@@ -234,6 +254,7 @@ function aggregateSnapshots(snapshots: RefreshResult[], key: string): RefreshRes
   const [fallbackBaseLanguage, fallbackTargetLanguage] = languagesFromKey(key);
   const baseLanguage = snapshots[0].baseLanguage ?? fallbackBaseLanguage;
   const targetLanguage = snapshots[0].targetLanguage ?? fallbackTargetLanguage;
+  const collectionMode = snapshots[0].collectionMode ?? collectionModeFromKey(key);
   const baseArticles = uniqueArticles(
     snapshots.flatMap((snapshot) => snapshot.baseArticles ?? snapshot.cnArticles ?? [])
   );
@@ -241,6 +262,9 @@ function aggregateSnapshots(snapshots: RefreshResult[], key: string): RefreshRes
     snapshots.flatMap((snapshot) => snapshot.targetArticles ?? snapshot.jpArticles ?? [])
   );
   const pairs = uniquePairs(snapshots.flatMap((snapshot) => snapshot.pairs));
+  const anchoredPairs = uniqueAnchoredPairs(
+    snapshots.flatMap((snapshot) => snapshot.anchoredPairs ?? [])
+  );
   const dateScope = uniqueDates(snapshots.flatMap((snapshot) => snapshot.dateScope ?? []));
   const sourceDateScope = uniqueDates(snapshots.flatMap((snapshot) => snapshot.sourceDateScope ?? []));
   const targetDateScope = uniqueDates(snapshots.flatMap((snapshot) => snapshot.targetDateScope ?? []));
@@ -249,6 +273,7 @@ function aggregateSnapshots(snapshots: RefreshResult[], key: string): RefreshRes
   return {
     ...snapshots[0],
     generatedAt: latestGeneratedAt(snapshots),
+    collectionMode,
     activeDate: undefined,
     archiveDates: undefined,
     dateScope,
@@ -259,7 +284,11 @@ function aggregateSnapshots(snapshots: RefreshResult[], key: string): RefreshRes
     cnArticles: baseArticles,
     jpArticles: targetLanguage === "JP" ? targetArticles : [],
     pairs,
-    stats: calculateStats(pairs, baseArticles.length, targetArticles.length, baseLanguage, targetLanguage),
+    anchoredPairs: anchoredPairs.length ? anchoredPairs : undefined,
+    stats:
+      collectionMode === "jp-major" && anchoredPairs.length
+        ? calculateAnchoredAggregateStats(anchoredPairs)
+        : calculateStats(pairs, baseArticles.length, targetArticles.length, baseLanguage, targetLanguage),
     warnings,
     run: aggregateRunMetadata(snapshots),
     refreshSignature: undefined
@@ -373,6 +402,10 @@ function pairTouchesDate(pair: ArticlePair, date: string) {
   );
 }
 
+function anchoredPairTouchesDate(pair: AnchoredArticlePair, date: string) {
+  return articleDate(pair.jp) === date;
+}
+
 function articleDate(article?: Article) {
   return article?.urlDate || article?.publishedDate;
 }
@@ -388,6 +421,68 @@ function uniqueArticles(articles: Article[]) {
 
 function uniquePairs(pairs: ArticlePair[]) {
   return [...new Map(pairs.map((pair) => [pair.id, pair])).values()];
+}
+
+function uniqueAnchoredPairs(pairs: AnchoredArticlePair[]) {
+  return [...new Map(pairs.map((pair) => [pair.id, pair])).values()];
+}
+
+function calculateAnchoredAggregateStats(pairs: AnchoredArticlePair[]) {
+  const cnArticles = uniqueArticles(pairs.map((pair) => pair.cn).filter(isArticle));
+  const jpArticles = uniqueArticles(pairs.map((pair) => pair.jp));
+  const matched = pairs.filter((pair) => pair.status === "matched" && pair.cn).length;
+  const allArticles = [...cnArticles, ...jpArticles];
+  const bodyDifference = pairs.filter((pair) => {
+    const analysis = pair.analysis;
+    return Boolean(
+      pair.cn &&
+        analysis &&
+        ((analysis.bodyDifferenceScore ?? 0) >= 35 ||
+          analysis.missingPoints.length > 0 ||
+          analysis.emphasizedPoints.length > 0)
+    );
+  }).length;
+  const framingShift = pairs.filter((pair) =>
+    Boolean(pair.cn && pair.analysis && (pair.analysis.framingShiftScore ?? 0) >= 55)
+  ).length;
+
+  return {
+    cnCount: cnArticles.length,
+    jpCount: jpArticles.length,
+    baseCount: cnArticles.length,
+    targetCount: jpArticles.length,
+    countsBySource: {
+      CN: cnArticles.length,
+      JP: jpArticles.length
+    },
+    cnDateCounts: countArticlesByDate(cnArticles),
+    jpDateCounts: countArticlesByDate(jpArticles),
+    dateCountsBySource: {
+      CN: countArticlesByDate(cnArticles),
+      JP: countArticlesByDate(jpArticles)
+    },
+    dateMismatches: allArticles.filter((article) => article.dateMismatch).length,
+    matched,
+    cnOnly: 0,
+    jpOnly: jpArticles.length - matched,
+    baseOnly: 0,
+    targetOnly: jpArticles.length - matched,
+    framingShift,
+    bodyDifference,
+    coverageRatio: jpArticles.length ? Math.round((matched / jpArticles.length) * 100) : 0
+  };
+}
+
+function countArticlesByDate(articles: Article[]) {
+  return articles.reduce<Record<string, number>>((counts, article) => {
+    const date = articleDate(article);
+    if (date) counts[date] = (counts[date] ?? 0) + 1;
+    return counts;
+  }, {});
+}
+
+function isArticle(article: Article | undefined): article is Article {
+  return Boolean(article);
 }
 
 function latestGeneratedAt(snapshots: RefreshResult[]) {
@@ -497,16 +592,37 @@ function rememberSnapshot(snapshot: RefreshResult, key: string) {
 }
 
 function comparisonKeyFromSnapshot(snapshot: RefreshResult) {
-  return comparisonKey(snapshot.baseLanguage ?? "CN", snapshot.targetLanguage ?? "JP");
+  return comparisonKey(
+    snapshot.baseLanguage ?? "CN",
+    snapshot.targetLanguage ?? "JP",
+    snapshot.collectionMode ?? "broad"
+  );
 }
 
-function comparisonKey(sourceLanguage: Source, targetLanguage: Source) {
-  return `${sourceLanguage}-${targetLanguage}`;
+function comparisonKey(
+  sourceLanguage: Source,
+  targetLanguage: Source,
+  collectionMode: "broad" | "jp-major" = "broad"
+) {
+  const pairKey = `${sourceLanguage}-${targetLanguage}`;
+  return collectionMode === "jp-major" ? `jp-major.${pairKey}` : pairKey;
 }
 
 function languagesFromKey(key: string): [Source, Source] {
-  const [source = "CN", target = "JP"] = key.split("-");
+  const pairKey = key.replace(/^jp-major\./, "");
+  const [source = "CN", target = "JP"] = pairKey.split("-");
   return [source as Source, target as Source];
+}
+
+function collectionModeFromKey(key: string): "broad" | "jp-major" {
+  return key.startsWith("jp-major.") ? "jp-major" : "broad";
+}
+
+function snapshotCollectionMode(options: SnapshotReadOptions): "broad" | "jp-major" {
+  const value = options.collectionMode ?? options.mode;
+  return typeof value === "string" && /^(jp-major|jp_major|anchored|jp-anchored)$/i.test(value)
+    ? "jp-major"
+    : "broad";
 }
 
 function latestFileName(key: string) {

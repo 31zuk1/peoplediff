@@ -3,12 +3,13 @@ import { createHash } from "node:crypto";
 import { isAuthorizedAdminRequest } from "@/lib/auth";
 import { readSnapshot, writeSnapshot } from "@/lib/cache";
 import { refreshOptionsSignature, refreshSnapshot } from "@/lib/compare";
+import { jpMajorRefreshSignature, refreshJapaneseMajorSnapshot } from "@/lib/jp-major";
 import { resolveCompareLanguages } from "@/lib/languages";
 import { acquireSnapshotLock } from "@/lib/snapshot-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 declare global {
   // eslint-disable-next-line no-var
@@ -17,7 +18,11 @@ declare global {
         string,
         {
           signature: string;
-          promise: Promise<Awaited<ReturnType<typeof refreshSnapshot>>>;
+          promise: Promise<
+            Awaited<
+              ReturnType<typeof refreshSnapshot> | ReturnType<typeof refreshJapaneseMajorSnapshot>
+            >
+          >;
         }
       >
     | undefined;
@@ -29,6 +34,7 @@ export async function GET(request: Request) {
     const snapshot = await readSnapshot(searchParams.get("date") ?? undefined, {
       sourceLanguage: searchParams.get("sourceLanguage") ?? searchParams.get("source"),
       targetLanguage: searchParams.get("targetLanguage") ?? searchParams.get("target"),
+      mode: collectionModeValue(searchParams.get("mode") ?? searchParams.get("collectionMode")),
       dateFrom: searchParams.get("dateFrom") ?? undefined,
       dateTo: searchParams.get("dateTo") ?? undefined,
       windowDays: searchParams.get("windowDays") ?? undefined
@@ -48,6 +54,14 @@ export async function POST(request: Request) {
     const { searchParams } = new URL(request.url);
     const body = asRecord(await request.json().catch(() => ({})));
     const aiArticleLimit = firstValue(body.aiArticleLimit, searchParams.get("aiArticleLimit"));
+    const mode = collectionModeValue(
+      firstValue(
+        body.mode,
+        body.collectionMode,
+        searchParams.get("mode"),
+        searchParams.get("collectionMode")
+      )
+    );
     const refreshOptions = {
       limit: numberValue(firstValue(body.limit, searchParams.get("limit"))),
       dates: dateList(firstValue(body.dates, searchParams.get("dates"))),
@@ -83,19 +97,36 @@ export async function POST(request: Request) {
         searchParams.get("target")
       )
     };
+    const jpMajorOptions = {
+      dates: refreshOptions.dates ?? refreshOptions.targetDates,
+      dateFrom: refreshOptions.dateFrom ?? refreshOptions.targetDateFrom,
+      dateTo: refreshOptions.dateTo ?? refreshOptions.targetDateTo,
+      maxPages: refreshOptions.maxPages,
+      maxArticles: refreshOptions.maxArticles,
+      aiArticleLimit: refreshOptions.aiArticleLimit,
+      maxQueries: numberValue(firstValue(body.maxQueries, searchParams.get("maxQueries")), 12),
+      candidatesPerQuery: numberValue(
+        firstValue(body.candidatesPerQuery, searchParams.get("candidatesPerQuery")),
+        20
+      ),
+      useAi: !explicitFalse(firstValue(body.useAi, body.ai, searchParams.get("useAi"), searchParams.get("ai")))
+    };
     const cacheTtlSeconds =
       numberValue(firstValue(body.cacheTtlSeconds, searchParams.get("cacheTtlSeconds"))) ?? 900;
     const forceRefresh = booleanValue(firstValue(body.forceRefresh, searchParams.get("forceRefresh")));
-    const signature = refreshOptionsSignature(refreshOptions);
-    const outputLockKey = refreshOutputLockKey(
-      refreshOptions.sourceLanguage,
-      refreshOptions.targetLanguage
-    );
+    const cacheSourceLanguage = mode === "jp-major" ? "CN" : refreshOptions.sourceLanguage;
+    const cacheTargetLanguage = mode === "jp-major" ? "JP" : refreshOptions.targetLanguage;
+    const signature =
+      mode === "jp-major"
+        ? jpMajorRefreshSignature(jpMajorOptions)
+        : refreshOptionsSignature(refreshOptions);
+    const outputLockKey = refreshOutputLockKey(cacheSourceLanguage, cacheTargetLanguage, mode);
 
     if (!forceRefresh && cacheTtlSeconds > 0) {
       const cached = await readSnapshot(undefined, {
-        sourceLanguage: refreshOptions.sourceLanguage,
-        targetLanguage: refreshOptions.targetLanguage
+        sourceLanguage: cacheSourceLanguage,
+        targetLanguage: cacheTargetLanguage,
+        mode
       });
       if (isFreshMatchingSnapshot(cached, signature, cacheTtlSeconds)) {
         return NextResponse.json(cached, {
@@ -144,7 +175,10 @@ export async function POST(request: Request) {
       );
     }
 
-    const refreshTask = refreshSnapshot(refreshOptions)
+    const refreshTask = (mode === "jp-major"
+      ? refreshJapaneseMajorSnapshot(jpMajorOptions)
+      : refreshSnapshot(refreshOptions)
+    )
       .then((snapshot) => writeSnapshot(snapshot))
       .finally(() => {
         inFlight.delete(outputLockKey);
@@ -190,6 +224,28 @@ function booleanValue(value: unknown) {
   return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 }
 
+function explicitFalse(value: unknown) {
+  if (value === false) return true;
+  if (typeof value !== "string") return false;
+  return ["0", "false", "no", "off"].includes(value.toLowerCase());
+}
+
+function collectionModeValue(value: unknown): "broad" | "jp-major" {
+  if (typeof value !== "string") return defaultCollectionMode();
+  const normalized = value.trim().toLowerCase();
+  if (/^(broad|legacy|wide)$/i.test(normalized)) return "broad";
+  if (/^(jp-major|jp_major|anchored|jp-anchored|jp_anchor|jp-anchor)$/i.test(normalized)) {
+    return "jp-major";
+  }
+  return defaultCollectionMode();
+}
+
+function defaultCollectionMode(): "broad" | "jp-major" {
+  const configured = process.env.PEOPLEDIFF_DEFAULT_MODE;
+  if (!configured) return "jp-major";
+  return /^(broad|legacy|wide)$/i.test(configured) ? "broad" : "jp-major";
+}
+
 function dateList(value: unknown) {
   if (Array.isArray(value)) {
     return value.filter((item): item is string => typeof item === "string");
@@ -226,9 +282,13 @@ function refreshLockName(signature: string) {
   return createHash("sha256").update(signature).digest("hex").slice(0, 32);
 }
 
-function refreshOutputLockKey(sourceLanguage: unknown, targetLanguage: unknown) {
+function refreshOutputLockKey(
+  sourceLanguage: unknown,
+  targetLanguage: unknown,
+  mode: "broad" | "jp-major" = "broad"
+) {
   const selection = resolveCompareLanguages({ sourceLanguage, targetLanguage });
-  return `${selection.sourceLanguage}-${selection.targetLanguage}`;
+  return `${mode}:${selection.sourceLanguage}-${selection.targetLanguage}`;
 }
 
 function refreshLockTtlMs() {

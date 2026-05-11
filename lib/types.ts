@@ -85,6 +85,30 @@ export type ArticlePair = {
   highlights: string[];
 };
 
+export type AnchoredPairStatus = "matched" | "unmatched";
+
+export type AnchoredMatchCandidate = {
+  article: Article;
+  score: number;
+  reason: string;
+  searchQuery?: string;
+  searchRank?: number;
+};
+
+export type AnchoredArticlePair = {
+  id: string;
+  status: AnchoredPairStatus;
+  jp: Article;
+  cn?: Article;
+  match_score: number;
+  match_reason: string;
+  candidate_count: number;
+  search_queries: string[];
+  candidates?: AnchoredMatchCandidate[];
+  analysis?: DifferenceAnalysis;
+  highlights: string[];
+};
+
 export type RefreshStats = {
   cnCount: number;
   jpCount: number;
@@ -126,6 +150,7 @@ export type RefreshRunMetadata = {
 export type RefreshResult = {
   generatedAt: string;
   mode: "live" | "demo" | "empty";
+  collectionMode?: "broad" | "jp-major";
   model: string;
   run?: RefreshRunMetadata;
   schemaVersion?: number;
@@ -146,11 +171,13 @@ export type RefreshResult = {
   sourceDateScope?: string[];
   targetDateScope?: string[];
   sourceLookbackDays?: number;
+  anchorSourceUrl?: string;
   baseArticles?: Article[];
   targetArticles?: Article[];
   cnArticles: Article[];
   jpArticles: Article[];
   pairs: ArticlePair[];
+  anchoredPairs?: AnchoredArticlePair[];
   stats: RefreshStats;
   warnings: string[];
 };

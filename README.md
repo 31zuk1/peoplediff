@@ -1,25 +1,31 @@
 # PeopleDiff
 
-PeopleDiffは、中国語版「人民网」を基準に、人民網の日本語版・英語版・仏語版など対象言語版の新着記事を比較し、言語ごとに変化する国家メディアのナラティブを観測するPoCダッシュボードです。
+PeopleDiffは、日本語版「人民日報の主要ニュース」を起点に、対応する中国語版原稿を探索し、人民網の対外発信における記事選択・本文量・政治表現・フレーミング差分を観測するPoCダッシュボードです。
 
 これは翻訳ビューアではありません。記事が「翻訳されたか」だけでなく、「どの記事が対外向けに選ばれたか」「同じ話題でも本文・論点・政治表現がどう変わったか」を見るためのOSINT / policy intelligence UIです。
 
 ## Features
 
-- 中国語版と対象言語版の新着・日別記事スクレイピング
-- 中国語版を基準にした対象言語切替（英語、日本語、仏語、スペイン語、ロシア語、アラビア語、韓国語、ドイツ語、ポルトガル語、スワヒリ語、イタリア語、カザフ語、タイ語、マレー語、ギリシャ語、ベトナム語、ウルドゥー語、ヒンディー語など）
+- 日本語版「人民日報の主要ニュース」から記事一覧・本文を深く取得するJPアンカーモード
+- 日本語記事ごとに人民網中国語版の検索API候補を探索し、本文・見出し・日付・固有名詞でスコアリング
+- 対応する中国語版が見つからない記事は `unmatched` として保持
+- 旧来の中国語版を基準にした対象言語切替（`mode=broad` で利用）
 - cheerioによる本文、日時、カテゴリ、URL抽出
 - OpenAI APIによる中国語/対象言語タイトルの日本語化、要約、本文差分分析
-- タイトル類似、翻訳タイトル類似、キーワード類似による記事マッチング
-- `MATCHED`、`CN ONLY`、対象言語のみ（JPの場合は`JP ONLY`）のフィルタ
-- `MATCHED`内での `BODY DIFF` / `FRAMING` 補助バッジ
+- JP起点ペア内での `BODY DIFF` / `FRAMING` 補助バッジ
 - 消えている論点を赤い `-`、強調されている論点を緑の `+` で表示
 - ダーク/ライトモード
 - ライブ更新の日付範囲指定、日付別スナップショット保存と日付セレクタ
 
+## Collection Modes
+
+既定は `jp-major` です。これは [人民網日本語版「人民日報の主要ニュース」](https://j.people.com.cn/95958/index.html) の記事をアンカーにして、対応する中国語版記事を探す設計です。PoC段階では大量の `JP ONLY` / `CN ONLY` を並べるより、JP記事ごとの対応関係の精度を優先します。
+
+旧来の広域収集は残してあります。APIや環境変数で `mode=broad` または `PEOPLEDIFF_DEFAULT_MODE=broad` を指定すると、従来のCN/対象言語一覧を並べて照合するモードになります。
+
 ## Language Coverage
 
-PeopleDiffの基準言語は現時点では中国語版（CN）固定です。対象言語はUIから切り替えられ、まずは `CN -> target` の1:1比較として動きます。
+PeopleDiffの本番既定はJPアンカーです。広域比較モードでは、基準言語は現時点では中国語版（CN）固定です。対象言語はUIから切り替えられ、`CN -> target` の1:1比較として動きます。
 
 人民網の外語チャンネルとして、2025年4月時点で英、法、俄、阿、西、日、韓、独、葡、スワヒリ、伊、カザフ（キリル）、タイ、マレー、ギリシャ、ベトナム、ウルドゥー、ヒンディーの18言語が確認できます。人民網サイトマップには、これとは別に蒙文、藏文、维文、哈文、朝鲜文、彝文、壮文などの民族語版も掲載されています。
 
@@ -74,7 +80,12 @@ PEOPLEDIFF_BLOB_PREFIX=snapshots/
 PEOPLEDIFF_ADMIN_TOKEN=change-me
 CRON_SECRET=change-me-too
 
+# Defaults to jp-major. Set to broad only for the older wide collection.
+PEOPLEDIFF_DEFAULT_MODE=jp-major
+PEOPLEDIFF_CRON_MODE=jp-major
+
 # Optional. Comma/space-separated cron target languages. Defaults to JP.
+# In jp-major mode, cron intentionally refreshes JP only.
 PEOPLEDIFF_CRON_TARGETS=JP,EN
 
 # Optional. Refresh/OpenAI/scrape limits
@@ -88,6 +99,10 @@ PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT=80
 PEOPLEDIFF_CRON_SOURCE_LOOKBACK_DAYS=3
 PEOPLEDIFF_CRON_ROLLING_DAYS=7
 PEOPLEDIFF_CRON_LATEST_OFFSET=0
+PEOPLEDIFF_JP_MAJOR_MAX_PAGES=3
+PEOPLEDIFF_JP_MAJOR_MAX_ARTICLES=80
+PEOPLEDIFF_JP_MAJOR_SEARCH_QUERIES=5
+PEOPLEDIFF_JP_MAJOR_CANDIDATES_PER_QUERY=8
 PEOPLEDIFF_REFRESH_LOCK_TTL_SECONDS=600
 ```
 
@@ -97,7 +112,7 @@ PEOPLEDIFF_REFRESH_LOCK_TTL_SECONDS=600
 npm run dev
 ```
 
-ブラウザで `http://localhost:3000` を開き、`最新記事を更新` を押してください。
+ブラウザで `http://localhost:3000` を開いてください。ローカル開発では更新ボタンが表示されます。本番では管理APIまたはcronでseedしたスナップショットを読み取ります。
 
 ライブ更新では日付範囲を指定できます。UIでは中国語版と対象言語版の両方を同じ期間で取得・表示します。
 
@@ -160,13 +175,15 @@ curl "http://localhost:3000/api/refresh?date=2026-05-07&targetLanguage=EN"
 
 注意: `data/snapshots/*.json` は `.gitignore` 対象です。履歴データはリポジトリにコミットしない前提です。
 
-本番で `PEOPLEDIFF_STORAGE=blob` を指定するか `BLOB_READ_WRITE_TOKEN` が存在する場合、同じスナップショット名をVercel Blobに保存します。既定のBlobパスは `snapshots/latest.json`、`snapshots/YYYY-MM-DD.json`、`snapshots/index.json` です。`CN-JP` 以外はファイル保存と同じく `latest.CN-EN.json`、`YYYY-MM-DD.CN-EN.json`、`index.CN-EN.json` のように言語ペア付きで保存されます。
+本番で `PEOPLEDIFF_STORAGE=blob` を指定するか `BLOB_READ_WRITE_TOKEN` が存在する場合、同じスナップショット名をVercel Blobに保存します。JPアンカーモードのBlobパスは `snapshots/latest.jp-major.CN-JP.json`、`snapshots/YYYY-MM-DD.jp-major.CN-JP.json`、`snapshots/index.jp-major.CN-JP.json` です。広域 `CN-JP` は既存互換のため従来通り `latest.json`、`YYYY-MM-DD.json`、`index.json` を使います。
 
 ## API
 
 ### `GET /api/refresh`
 
 最新スナップショットを返します。
+
+既定ではJPアンカーモードを返します。旧広域モードを見る場合は `mode=broad` を付けます。
 
 ### `GET /api/refresh?date=YYYY-MM-DD`
 
@@ -190,29 +207,29 @@ curl "http://localhost:3000/api/refresh?date=2026-05-07&targetLanguage=EN"
 curl -X POST "http://localhost:3000/api/refresh" \
   -H "Authorization: Bearer $PEOPLEDIFF_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"targetLanguage":"EN","dates":["2026-05-07","2026-05-06"]}'
+  -d '{"mode":"jp-major","dates":["2026-05-07","2026-05-06"]}'
 ```
 
 リクエスト本文:
 
 ```json
 {
-  "targetLanguage": "EN",
+  "mode": "jp-major",
   "dateFrom": "2026-05-06",
   "dateTo": "2026-05-07",
-  "maxPages": 8,
-  "maxArticles": 240,
+  "maxPages": 3,
+  "maxArticles": 80,
   "aiArticleLimit": 32
 }
 ```
 
-`dates` に `["2026-05-07", "2026-05-06"]` のような配列を渡すこともできます。UIと同じ挙動にする場合は、`sourceDates` と `targetDates` に同じ配列を渡します。
+`dates` に `["2026-05-07", "2026-05-06"]` のような配列を渡すこともできます。JPアンカーモードではこれは日本語版「人民日報の主要ニュース」の掲載日フィルタです。
 
-`dates` / `dateFrom` / `dateTo` を省略した場合は、トップページ中心の小さなサンプル取得になります。
+`dates` / `dateFrom` / `dateTo` を省略した場合は、95958の先頭ページ中心の小さなサンプル取得になります。旧来の広域収集を呼ぶ場合は `{"mode":"broad","targetLanguage":"EN"}` のように指定します。
 
 ### `GET /api/cron/refresh`
 
-Vercel Cron向けの更新APIです。`CRON_SECRET` を `Authorization: Bearer <secret>` で受け取り、`PEOPLEDIFF_CRON_TARGETS` に指定した対象言語を更新します。
+Vercel Cron向けの更新APIです。`CRON_SECRET` を `Authorization: Bearer <secret>` で受け取り、既定ではJPアンカーモードで当日分を更新します。`/api/cron/refresh/0` から `/api/cron/refresh/6` をスケジュールしておくと、毎日直近7日分のスナップショットが補充され、公開画面は保存済みの直近7日を集約表示します。
 
 ```bash
 curl "http://localhost:3000/api/cron/refresh" \
@@ -257,6 +274,8 @@ Vercelにデプロイできます。
    - optional: `OPENAI_REPAIR_MODEL`
    - `PEOPLEDIFF_ADMIN_TOKEN`
    - `CRON_SECRET`
+   - optional: `PEOPLEDIFF_DEFAULT_MODE=jp-major`
+   - optional: `PEOPLEDIFF_CRON_MODE=jp-major`
    - optional: `PEOPLEDIFF_CRON_TARGETS`
    - optional: `PEOPLEDIFF_AI_ARTICLE_LIMIT`
    - optional: `PEOPLEDIFF_AI_CONCURRENCY`
@@ -267,6 +286,10 @@ Vercelにデプロイできます。
    - optional: `PEOPLEDIFF_CRON_SOURCE_LOOKBACK_DAYS`
    - optional: `PEOPLEDIFF_CRON_ROLLING_DAYS`
    - optional: `PEOPLEDIFF_CRON_LATEST_OFFSET`
+   - optional: `PEOPLEDIFF_JP_MAJOR_MAX_PAGES`
+   - optional: `PEOPLEDIFF_JP_MAJOR_MAX_ARTICLES`
+   - optional: `PEOPLEDIFF_JP_MAJOR_SEARCH_QUERIES`
+   - optional: `PEOPLEDIFF_JP_MAJOR_CANDIDATES_PER_QUERY`
    - optional: `PEOPLEDIFF_READ_WINDOW_DAYS`
    - optional: `PEOPLEDIFF_REFRESH_LOCK_TTL_SECONDS`
    - `PEOPLEDIFF_STORAGE=blob`
@@ -281,14 +304,14 @@ Vercelにデプロイできます。
 Preview deploymentで最低限次を確認してください。
 
 ```bash
-curl -i "https://<preview-host>/api/refresh?targetLanguage=JP"
+curl -i "https://<preview-host>/api/refresh"
 curl -i -X POST "https://<preview-host>/api/refresh" \
   -H "content-type: application/json" \
-  -d '{"targetLanguage":"JP"}'
+  -d '{"mode":"jp-major"}'
 curl -i -X POST "https://<preview-host>/api/refresh" \
   -H "authorization: Bearer $PEOPLEDIFF_ADMIN_TOKEN" \
   -H "content-type: application/json" \
-  -d '{"targetLanguage":"JP","dates":["YYYY-MM-DD"],"maxPages":2,"maxArticles":40,"aiArticleLimit":8}'
+  -d '{"mode":"jp-major","dates":["YYYY-MM-DD"],"maxPages":2,"maxArticles":20,"aiArticleLimit":8}'
 curl -i "https://<preview-host>/api/cron/refresh" \
   -H "authorization: Bearer $CRON_SECRET"
 ```
@@ -301,10 +324,10 @@ curl -i "https://<preview-host>/api/cron/refresh" \
 - secret付きcronは `200`
 - 公開UIに更新ボタンが出ない
 - `run.storageBackend` が `blob`
-- Blobに `latest.json`、日付snapshot、`index.json` が作成される
+- Blobに `latest.jp-major.CN-JP.json`、日付snapshot、`index.jp-major.CN-JP.json` が作成される
 - 日付指定GETで保存済みsnapshotが読める
 
-cronは日別に分割して対象言語を順次更新します。`PEOPLEDIFF_CRON_TARGETS` を増やす場合は、各日別ジョブが `maxDuration=300` に収まるように `PEOPLEDIFF_CRON_MAX_PAGES`、`PEOPLEDIFF_CRON_MAX_ARTICLES`、`PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT` を小さめに始めてください。Vercel Hobbyではcronごとの実行は1日1回までですが、プロジェクトあたり100 cron jobsまで使えるため、7本の日別cronでローリング1週間を維持します。
+cronは日別に分割してJPアンカー記事を更新します。各日別ジョブが `maxDuration=300` に収まるように、まずは `PEOPLEDIFF_JP_MAJOR_MAX_PAGES`、`PEOPLEDIFF_JP_MAJOR_MAX_ARTICLES`、`PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT` を小さめに始めてください。Vercel Hobbyではcronごとの実行は1日1回までですが、プロジェクトあたり100 cron jobsまで使えるため、7本の日別cronでローリング1週間を維持します。
 
 ## Current Limitations
 
