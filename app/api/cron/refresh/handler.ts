@@ -3,93 +3,173 @@ import { createHash } from "node:crypto";
 import { isAuthorizedBearer } from "@/lib/auth";
 import { writeSnapshot } from "@/lib/cache";
 import { refreshSnapshot } from "@/lib/compare";
+import { refreshJapaneseMajorSnapshot } from "@/lib/jp-major";
 import { DEFAULT_TARGET_LANGUAGE, TARGET_LANGUAGE_CODES } from "@/lib/languages";
 import { acquireSnapshotLock } from "@/lib/snapshot-store";
+import { collectionMode, defaultCollectionMode } from "@/lib/collection-mode";
+import { assertUsableCollection, snapshotHealth } from "@/lib/health";
 
 const JST_TIME_ZONE = "Asia/Tokyo";
 const DEFAULT_ROLLING_DAYS = 7;
 type TargetLanguage = (typeof TARGET_LANGUAGE_CODES)[number];
 
-export async function handleCronRefresh(request: Request, offsetInput?: unknown) {
-  if (!isAuthorizedBearer(request, process.env.CRON_SECRET)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+const defaultDependencies = {
+  refreshSnapshot,
+  refreshJapaneseMajorSnapshot,
+  writeSnapshot,
+  acquireSnapshotLock,
+  now: () => new Date()
+};
 
-  const targetPlan = cronTargets(process.env.PEOPLEDIFF_CRON_TARGETS);
-  if (!targetPlan.targets.length) {
+export function createCronRefreshHandler(overrides: Partial<typeof defaultDependencies> = {}) {
+  const dependencies = { ...defaultDependencies, ...overrides };
+  return async function handleCronRefresh(request: Request, offsetInput?: unknown) {
+    if (!isAuthorizedBearer(request, process.env.CRON_SECRET)) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const { searchParams } = new URL(request.url);
+    const mode = cronCollectionMode(searchParams.get("mode"));
+    const configuredTargetPlan = cronTargets(process.env.PEOPLEDIFF_CRON_TARGETS);
+    const ignoredTargets =
+      mode === "jp-major"
+        ? configuredTargetPlan.targets.filter((target) => target !== "JP")
+        : [];
+    const targetPlan =
+      mode === "jp-major"
+        ? {
+            targets: ["JP" as TargetLanguage],
+            invalidTargets: configuredTargetPlan.invalidTargets,
+            ignoredTargets
+          }
+        : { ...configuredTargetPlan, ignoredTargets: [] as TargetLanguage[] };
+
+    if (!targetPlan.targets.length) {
+      return NextResponse.json(
+        {
+          error: "No valid cron targets configured",
+          invalidTargets: targetPlan.invalidTargets,
+          collectionMode: mode
+        },
+        { status: 400 }
+      );
+    }
+
+    const offset = rollingOffset(offsetInput ?? searchParams.get("offset"));
+    // Each job collects a completed publication day: offset 0 is yesterday.
+    const targetDate = dateInJst(offset + 1, dependencies.now());
+    const updateLatest = offset === latestOffset();
+    const results = [];
+
+    for (const targetLanguage of targetPlan.targets) {
+      const lockKey = `${mode}:CN-${targetLanguage}`;
+      let lock: Awaited<ReturnType<typeof acquireSnapshotLock>> | undefined;
+      try {
+        lock = await dependencies.acquireSnapshotLock(refreshLockName(lockKey), refreshLockTtlMs());
+        if (!lock) {
+          results.push({
+            targetLanguage,
+            collectionMode: mode,
+            ok: false,
+            locked: true,
+            error: "Refresh already running"
+          });
+          continue;
+        }
+
+        const snapshot =
+          mode === "jp-major"
+            ? await dependencies.refreshJapaneseMajorSnapshot({
+                dates: [targetDate],
+                maxPages:
+                  numberFromEnv("PEOPLEDIFF_JP_MAJOR_MAX_PAGES") ??
+                  numberFromEnv("PEOPLEDIFF_CRON_MAX_PAGES"),
+                maxArticles:
+                  numberFromEnv("PEOPLEDIFF_JP_MAJOR_MAX_ARTICLES") ??
+                  numberFromEnv("PEOPLEDIFF_CRON_MAX_ARTICLES"),
+                aiArticleLimit:
+                  numberFromEnv("PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT", { allowZero: true }) ??
+                  numberFromEnv("PEOPLEDIFF_AI_ARTICLE_LIMIT", { allowZero: true }),
+                maxQueries: numberFromEnv("PEOPLEDIFF_JP_MAJOR_SEARCH_QUERIES"),
+                candidatesPerQuery: numberFromEnv("PEOPLEDIFF_JP_MAJOR_CANDIDATES_PER_QUERY")
+              })
+            : await dependencies.refreshSnapshot({
+                targetLanguage,
+                dates: [targetDate],
+                targetDates: [targetDate],
+                sourceLookbackDays: numberFromEnv("PEOPLEDIFF_CRON_SOURCE_LOOKBACK_DAYS") ?? 3,
+                limit: numberFromEnv("PEOPLEDIFF_CRON_LIMIT"),
+                maxPages: numberFromEnv("PEOPLEDIFF_CRON_MAX_PAGES"),
+                maxArticles: numberFromEnv("PEOPLEDIFF_CRON_MAX_ARTICLES"),
+                aiArticleLimit: numberFromEnv("PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT", {
+                  allowZero: true
+                })
+              });
+        assertUsableCollection(snapshot);
+        const archived = await dependencies.writeSnapshot(snapshot, { updateLatest });
+        const health = snapshotHealth(archived, { now: dependencies.now(), historical: true });
+        if (health.status === "ok" && archived.warnings.length) {
+          health.status = "degraded";
+          health.issues.push({ code: "refresh_warnings", message: "取得または分析に警告があります。警告の内容を確認してください。" });
+        }
+        results.push({
+          targetLanguage,
+          collectionMode: mode,
+          ok: true,
+          degraded: health.status !== "ok",
+          health,
+          aiStatus: archived.run?.openaiStatus ?? "unknown",
+          collection: archived.collection,
+          generatedAt: archived.generatedAt,
+          archiveDates: archived.archiveDates,
+          stats: archived.stats,
+          warnings: archived.warnings
+        });
+      } catch {
+        results.push({
+          targetLanguage,
+          collectionMode: mode,
+          ok: false,
+          error: "収集または保存に失敗しました。収集元・保存先・サービス設定を確認してください。"
+        });
+      } finally {
+        if (lock) {
+          try {
+            await lock.release();
+          } catch {
+            results.push({ targetLanguage, collectionMode: mode, ok: false, error: "更新ロックの解除に失敗しました。" });
+          }
+        }
+      }
+    }
+
+    const hasFailure = results.some((result) => !result.ok);
+    const degraded = results.some((result) => "degraded" in result && result.degraded);
     return NextResponse.json(
       {
-        error: "No valid cron targets configured",
-        invalidTargets: targetPlan.invalidTargets
+        refreshedAt: dependencies.now().toISOString(),
+        status: hasFailure ? "failed" : degraded ? "degraded" : "ok",
+        degraded,
+        timeZone: JST_TIME_ZONE,
+        collectionMode: mode,
+        rollingDayOffset: offset,
+        targetDate,
+        updateLatest,
+        targets: targetPlan.targets,
+        invalidTargets: targetPlan.invalidTargets,
+        ignoredTargets: targetPlan.ignoredTargets,
+        results
       },
-      { status: 400 }
+      { status: hasFailure ? 500 : 200 }
     );
-  }
+  };
+}
 
-  const { searchParams } = new URL(request.url);
-  const offset = rollingOffset(offsetInput ?? searchParams.get("offset"));
-  const targetDate = dateInJst(offset);
-  const updateLatest = offset === latestOffset();
-  const results = [];
+export const handleCronRefresh = createCronRefreshHandler();
 
-  for (const targetLanguage of targetPlan.targets) {
-    const refreshOptions = {
-      targetLanguage,
-      dates: [targetDate],
-      targetDates: [targetDate],
-      sourceLookbackDays: numberFromEnv("PEOPLEDIFF_CRON_SOURCE_LOOKBACK_DAYS") ?? 3,
-      limit: numberFromEnv("PEOPLEDIFF_CRON_LIMIT"),
-      maxPages: numberFromEnv("PEOPLEDIFF_CRON_MAX_PAGES"),
-      maxArticles: numberFromEnv("PEOPLEDIFF_CRON_MAX_ARTICLES"),
-      aiArticleLimit: numberFromEnv("PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT")
-    };
-    const lock = await acquireSnapshotLock(refreshLockName(`CN-${targetLanguage}`), refreshLockTtlMs());
-    if (!lock) {
-      results.push({
-        targetLanguage,
-        ok: false,
-        locked: true,
-        error: "Refresh already running"
-      });
-      continue;
-    }
-
-    try {
-      const snapshot = await refreshSnapshot(refreshOptions);
-      const archived = await writeSnapshot(snapshot, { updateLatest });
-      results.push({
-        targetLanguage,
-        ok: true,
-        generatedAt: archived.generatedAt,
-        archiveDates: archived.archiveDates,
-        stats: archived.stats,
-        warnings: archived.warnings
-      });
-    } catch (error) {
-      results.push({
-        targetLanguage,
-        ok: false,
-        error: errorMessage(error)
-      });
-    } finally {
-      await lock.release();
-    }
-  }
-
-  const hasFailure = results.some((result) => !result.ok);
-  return NextResponse.json(
-    {
-      refreshedAt: new Date().toISOString(),
-      timeZone: JST_TIME_ZONE,
-      rollingDayOffset: offset,
-      targetDate,
-      updateLatest,
-      targets: targetPlan.targets,
-      invalidTargets: targetPlan.invalidTargets,
-      results
-    },
-    { status: hasFailure ? 500 : 200 }
-  );
+function cronCollectionMode(input: string | null): "broad" | "jp-major" {
+  const configured = input ?? process.env.PEOPLEDIFF_CRON_MODE;
+  return collectionMode(configured, defaultCollectionMode());
 }
 
 function cronTargets(input: string | undefined) {
@@ -135,8 +215,8 @@ function latestOffset() {
   return Math.min(rollingDays() - 1, Math.max(0, configured));
 }
 
-function dateInJst(offset: number) {
-  return addDays(formatJstDate(new Date()), -offset);
+function dateInJst(offset: number, now: Date) {
+  return addDays(formatJstDate(now), -offset);
 }
 
 function formatJstDate(date: Date) {
@@ -156,15 +236,12 @@ function addDays(date: string, days: number) {
   return value.toISOString().slice(0, 10);
 }
 
-function numberFromEnv(name: string) {
+function numberFromEnv(name: string, options: { allowZero?: boolean } = {}) {
   const raw = process.env[name];
   if (!raw) return undefined;
   const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
+  const minimum = options.allowZero ? 0 : 1;
+  return Number.isFinite(value) && value >= minimum ? Math.round(value) : undefined;
 }
 
 function refreshLockName(signature: string) {

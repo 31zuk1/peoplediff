@@ -1,6 +1,13 @@
 import OpenAI from "openai";
+import { createHash } from "node:crypto";
 import { getPeopleLanguageConfig } from "./languages";
-import { recordOpenAiCompletionUsage } from "./telemetry";
+import {
+  beginOpenAiAttempt,
+  recordOpenAiCacheHit,
+  recordOpenAiCompletionUsage,
+  recordOpenAiFailure,
+  recordOpenAiSuccess
+} from "./telemetry";
 import type { Article, DifferenceAnalysis } from "./types";
 import { compactSummary, extractKeywords, truncate } from "./text";
 
@@ -35,13 +42,19 @@ declare global {
 }
 
 function getClient() {
-  if (!process.env.OPENAI_API_KEY) return undefined;
-  client ??= new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  if (!process.env.OPENAI_API_KEY?.trim()) return undefined;
+  client ??= new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY.trim(),
+    // One attempt per article, bounded by the per-refresh circuit breaker.
+    // In particular, retrying a 429 quota error cannot restore API access.
+    maxRetries: 0,
+    timeout: 20_000
+  });
   return client;
 }
 
 export function activeModelLabel() {
-  return process.env.OPENAI_API_KEY ? MODEL : "local-heuristic";
+  return process.env.OPENAI_API_KEY?.trim() ? MODEL : "local-heuristic";
 }
 
 type EnrichOptions = {
@@ -82,6 +95,7 @@ export async function enrichChineseArticle(
   if (!openai) {
     return {
       ...article,
+      enrichmentStatus: "heuristic",
       translatedTitle: article.title,
       summary: compactSummary(article.body, 180),
       keywords: article.keywords.length ? article.keywords : extractKeywords(article.body)
@@ -118,10 +132,11 @@ Title: ${article.title}
 Body:
 ${truncate(article.body, 2600)}`
       }
-    ]);
+    ], { validate: isArticleEnrichment });
 
     return setOpenAiCache(cacheKey, {
       ...article,
+      enrichmentStatus: "ai",
       translatedTitle: json.translatedTitle || article.title,
       summary: json.summary || compactSummary(article.body, 180),
       keywords: sanitizeKeywords(json.keywords, article)
@@ -129,6 +144,7 @@ ${truncate(article.body, 2600)}`
   } catch {
     return {
       ...article,
+      enrichmentStatus: "heuristic",
       translatedTitle: article.title,
       summary: compactSummary(article.body, 180),
       keywords: article.keywords.length ? article.keywords : extractKeywords(article.body)
@@ -145,6 +161,7 @@ export async function enrichTargetArticle(
   if (!openai) {
     return {
       ...article,
+      enrichmentStatus: "heuristic",
       translatedTitle: article.translatedTitle || article.title,
       summary: compactSummary(article.body, language.summaryLength),
       keywords: article.keywords.length ? article.keywords : extractKeywords(article.body)
@@ -183,10 +200,11 @@ Title: ${article.title}
 Body:
 ${truncate(article.body, 2600)}`
       }
-    ]);
+    ], { validate: isArticleEnrichment });
 
     return setOpenAiCache(cacheKey, {
       ...article,
+      enrichmentStatus: "ai",
       translatedTitle: json.translatedTitle || article.translatedTitle || article.title,
       summary: json.summary || compactSummary(article.body, language.summaryLength),
       keywords: sanitizeKeywords(json.keywords, article)
@@ -194,6 +212,7 @@ ${truncate(article.body, 2600)}`
   } catch {
     return {
       ...article,
+      enrichmentStatus: "heuristic",
       translatedTitle: article.translatedTitle || article.title,
       summary: compactSummary(article.body, language.summaryLength),
       keywords: article.keywords.length ? article.keywords : extractKeywords(article.body)
@@ -210,11 +229,11 @@ export async function adjudicateSameTopicMatch(
   const openai = getClient();
   if (!openai || !candidates.length) return undefined;
   const cacheKey = [
-    "same-topic-v2",
+    "same-topic-v3",
     MODEL,
     target.id,
-    target.body.length,
-    candidates.map((candidate) => `${candidate.baseId}:${candidate.article.body.length}`).join("|")
+    articleFingerprint(target),
+    candidates.map((candidate) => `${candidate.baseId}:${articleFingerprint(candidate.article)}`).join("|")
   ].join(":");
   const cached = getOpenAiCache<SameTopicDecision>(cacheKey);
   if (cached) return cached;
@@ -278,7 +297,10 @@ keywords: ${candidate.article.keywords.join(", ")}`
   )
   .join("\n\n")}`
       }
-    ]);
+    ], {
+      validate: (input) => isSameTopicDecision(input) && (!input.sameTopic ||
+        candidates.some((candidate) => candidate.baseId === input.baseId))
+    });
 
     const baseId =
       typeof json.baseId === "string" && candidates.some((candidate) => candidate.baseId === json.baseId)
@@ -298,21 +320,22 @@ keywords: ${candidate.article.keywords.join(", ")}`
 
 export async function analyzeDifference(
   cn: Article,
-  jp: Article
+  jp: Article,
+  options: EnrichOptions = {}
 ): Promise<DifferenceAnalysis> {
   const baseLanguage = getPeopleLanguageConfig(cn.source);
   const targetLanguage = getPeopleLanguageConfig(jp.source);
   const fallback = sanitizeDifferenceAnalysisForJapaneseDisplay(localDifference(cn, jp));
-  const openai = getClient();
+  const openai = options.useAi === false ? undefined : getClient();
   if (!openai) return fallback;
   const cacheKey = [
-    "diff-v3-ja-display",
+    "diff-v4-analysis-status",
     MODEL,
     REPAIR_MODEL,
     cn.id,
-    cn.body.length,
+    articleFingerprint(cn),
     jp.id,
-    jp.body.length
+    articleFingerprint(jp)
   ].join(":");
   const cached = getOpenAiCache<DifferenceAnalysis>(cacheKey);
   if (cached) return sanitizeDifferenceAnalysisForJapaneseDisplay(cached, fallback);
@@ -353,7 +376,8 @@ bodyDifferenceScoreは0-100。分量、具体情報、背景、引用、経歴�
 framingShiftScoreは0-100。価値判断、政治的表現、批判/称賛の向き、読者への見せ方が違うほど高くしてください。
 shiftScoreはmax(bodyDifferenceScore, framingShiftScore)を入れてください。
 重要: 差分観測UIなので、軽微でも本文から観測できる省略・追加・強調・圧縮はmissingPoints/emphasizedPointsに書いてください。
-完全に同じと言える場合だけ空配列にしてください。
+本文から確認できる意味のある差分がなければ空配列にしてください。翻訳上の語順・文字数・表記の違いだけから、省略や政治的編集を推測しないでください。
+本文は上限で切り詰める場合があります。抜粋範囲に見当たらないだけの情報を、記事全体から削除された情報と断定しないでください。確認できない場合はその限界をverdictに明記してください。
 論調差が小さくても本文の具体情報量に差がある場合は、missingPoints/emphasizedPointsに具体的に書いてください。
 差が軽微ならtoneDifferenceに「大きな論調差は限定的」と書きつつ、本文差分は別途列挙してください。
 missingPointsは「${baseLanguage.editionLabel}にあり${targetLanguage.editionLabel}で欠落または明確に弱い論点」だけ。
@@ -362,15 +386,17 @@ emphasizedPointsは「${targetLanguage.editionLabel}で${baseLanguage.editionLab
 
 Base (${baseLanguage.code}) title: ${cn.title}
 Base translated title: ${cn.translatedTitle || cn.title}
+Base body excerpt: ${Math.min(cn.body.length, 3200)} / ${cn.body.length} characters
 Base body:
 ${truncate(cn.body, 3200)}
 
 Target (${targetLanguage.code}) title: ${jp.title}
 Target translated title: ${jp.translatedTitle || jp.title}
+Target body excerpt: ${Math.min(jp.body.length, 3200)} / ${jp.body.length} characters
 Target body:
 ${truncate(jp.body, 3200)}`
       }
-    ]);
+    ], { validate: isDifferenceAnalysis });
     const normalized = normalizeDifference(json, fallback);
     const repaired = await ensureJapaneseAnalysis(openai, normalized, fallback);
     return setOpenAiCache(cacheKey, repaired);
@@ -379,30 +405,84 @@ ${truncate(jp.body, 3200)}`
   }
 }
 
-async function askJson<T>(
+export async function askJson<T>(
   openai: OpenAI,
   messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
-  options: { model?: string; temperature?: number } = {}
+  options: { model?: string; temperature?: number; validate?: (input: Record<string, unknown>) => boolean } = {}
 ): Promise<T> {
+  if (!beginOpenAiAttempt()) throw new Error("AI processing is paused for this refresh");
   const model = options.model ?? MODEL;
-  const completion = await openai.chat.completions.create({
-    model,
-    temperature: options.temperature ?? 0.2,
-    response_format: { type: "json_object" },
-    messages
-  });
-  recordOpenAiCompletionUsage(model, completion.usage);
+  try {
+    const completion = await openai.chat.completions.create({
+      model,
+      temperature: options.temperature ?? 0.2,
+      response_format: { type: "json_object" },
+      messages
+    }, { maxRetries: 0, timeout: 20_000 });
+    recordOpenAiCompletionUsage(model, completion.usage);
+    const choice = completion.choices[0];
+    if (!choice?.message.content || choice.finish_reason !== "stop" || choice.message.refusal) {
+      throw new InvalidOpenAiResponseError();
+    }
+    const parsed: unknown = JSON.parse(choice.message.content);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Object.keys(parsed).length ||
+      (options.validate && !options.validate(parsed as Record<string, unknown>))) {
+      throw new InvalidOpenAiResponseError();
+    }
+    recordOpenAiSuccess();
+    return parsed as T;
+  } catch (error) {
+    recordOpenAiFailure(error);
+    throw error;
+  }
+}
 
-  const content = completion.choices[0]?.message?.content || "{}";
-  return JSON.parse(content) as T;
+class InvalidOpenAiResponseError extends Error {
+  name = "InvalidOpenAiResponseError";
+  constructor() { super("AI response did not satisfy the expected JSON format"); }
+}
+
+function isArticleEnrichment(input: Record<string, unknown>) {
+  return typeof input.translatedTitle === "string" && Boolean(input.translatedTitle.trim()) &&
+    typeof input.summary === "string" && Boolean(input.summary.trim()) && isStringArray(input.keywords);
+}
+
+function isSameTopicDecision(input: Record<string, unknown>) {
+  return typeof input.sameTopic === "boolean" &&
+    (input.baseId === null || typeof input.baseId === "string") &&
+    typeof input.matchConfidence === "number" && Number.isFinite(input.matchConfidence) &&
+    typeof input.reason === "string";
+}
+
+function isDifferenceAnalysis(input: Record<string, unknown>) {
+  return typeof input.sameTopic === "boolean" &&
+    ["matchConfidence", "bodyDifferenceScore", "framingShiftScore", "shiftScore"].every(
+      (field) => typeof input[field] === "number" && Number.isFinite(input[field])
+    ) && DISPLAY_ARRAY_FIELDS.every((field) => isStringArray(input[field])) &&
+    DISPLAY_TEXT_FIELDS.every((field) => typeof input[field] === "string" && Boolean(input[field].trim()));
+}
+
+function isStringArray(input: unknown): input is string[] {
+  return Array.isArray(input) && input.every((item) => typeof item === "string");
+}
+
+function articleFingerprint(article: Article) {
+  return createHash("sha256").update(JSON.stringify([
+    article.title, article.translatedTitle, article.body, article.summary, article.keywords
+  ])).digest("hex").slice(0, 24);
 }
 
 function openAiCacheKey(kind: string, article: Article) {
-  return [kind, MODEL, article.source, article.id, article.body.length].join(":");
+  // Enrichment prompts contain original title/body only. The JP anchored matcher
+  // may receive this same article with enrichment already attached.
+  const content = createHash("sha256").update(JSON.stringify([article.title, article.body])).digest("hex").slice(0, 24);
+  return [kind, MODEL, article.source, article.id, content].join(":");
 }
 
 function getOpenAiCache<T>(key: string) {
-  return openAiCache().get(key) as T | undefined;
+  const cached = openAiCache().get(key) as T | undefined;
+  if (cached !== undefined) recordOpenAiCacheHit();
+  return cached;
 }
 
 function setOpenAiCache<T>(key: string, value: T) {
@@ -436,31 +516,20 @@ function sanitizeKeywords(keywords: string[] | undefined, article: Article) {
 }
 
 function localDifference(cn: Article, jp: Article): DifferenceAnalysis {
-  const cnKeywords = cn.keywords.slice(0, 6);
-  const jpKeywords = jp.keywords.slice(0, 6);
-  const missing = cnKeywords.filter((keyword) => !jpKeywords.includes(keyword)).slice(0, 4);
-  const emphasized = jpKeywords.filter((keyword) => !cnKeywords.includes(keyword)).slice(0, 4);
-  const bodyGap = Math.abs(cn.body.length - jp.body.length);
-  const bodyDifferenceScore = Math.min(70, Math.round(bodyGap / 180));
-  const framingShiftScore = 0;
-  const shiftScore = Math.max(bodyDifferenceScore, framingShiftScore);
+  // Different scripts and word counts are not evidence of omitted content or
+  // framing. Absence of AI analysis must also not overturn a topic match.
   return {
-    sameTopic: true,
-    matchConfidence: Math.max(35, 100 - shiftScore),
-    bodyDifferenceScore,
-    framingShiftScore,
-    cnPoints: [cn.summary],
-    jpPoints: [jp.summary],
-    missingPoints: missing,
-    emphasizedPoints: emphasized,
-    toneDifference:
-      shiftScore > 35
-        ? "語彙と分量の差から、対外向け編集の可能性が高いペアです。"
-        : "顕著な論調差は見られません。",
-    politicalLanguage:
-      "OPENAI_API_KEYを設定すると、政治的表現の変化を本文ベースで抽出します。",
-    verdict: "ローカルヒューリスティックによる暫定判定です。",
-    shiftScore
+    analysisStatus: "unavailable",
+    bodyDifferenceScore: 0,
+    framingShiftScore: 0,
+    cnPoints: [`${getPeopleLanguageConfig(cn.source).editionLabel}の要点は未分析です。原文を確認してください。`],
+    jpPoints: [`${getPeopleLanguageConfig(jp.source).editionLabel}の要点は未分析です。原文を確認してください。`],
+    missingPoints: [],
+    emphasizedPoints: [],
+    toneDifference: "論調差分は未分析です。差分がないという判定ではありません。",
+    politicalLanguage: "政治的表現の差分は未分析です。",
+    verdict: "AIによる本文比較は未実施です。同一話題の照合結果のみを表示しています。",
+    shiftScore: 0
   };
 }
 
@@ -482,6 +551,7 @@ function normalizeDifference(
   );
 
   return {
+    analysisStatus: "ai",
     sameTopic: input.sameTopic ?? fallback.sameTopic,
     matchConfidence: normalizeScore(input.matchConfidence, fallback.matchConfidence ?? 0),
     bodyDifferenceScore,

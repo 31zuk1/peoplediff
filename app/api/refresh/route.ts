@@ -3,12 +3,14 @@ import { createHash } from "node:crypto";
 import { isAuthorizedAdminRequest } from "@/lib/auth";
 import { readSnapshot, writeSnapshot } from "@/lib/cache";
 import { refreshOptionsSignature, refreshSnapshot } from "@/lib/compare";
+import { jpMajorRefreshSignature, refreshJapaneseMajorSnapshot } from "@/lib/jp-major";
 import { resolveCompareLanguages } from "@/lib/languages";
 import { acquireSnapshotLock } from "@/lib/snapshot-store";
+import { collectionMode, defaultCollectionMode } from "@/lib/collection-mode";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 declare global {
   // eslint-disable-next-line no-var
@@ -17,7 +19,11 @@ declare global {
         string,
         {
           signature: string;
-          promise: Promise<Awaited<ReturnType<typeof refreshSnapshot>>>;
+          promise: Promise<
+            Awaited<
+              ReturnType<typeof refreshSnapshot> | ReturnType<typeof refreshJapaneseMajorSnapshot>
+            >
+          >;
         }
       >
     | undefined;
@@ -26,16 +32,17 @@ declare global {
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
-    const snapshot = await readSnapshot(searchParams.get("date") ?? undefined, {
+    const snapshot = await readSnapshot(dateValue(searchParams.get("date")), {
       sourceLanguage: searchParams.get("sourceLanguage") ?? searchParams.get("source"),
       targetLanguage: searchParams.get("targetLanguage") ?? searchParams.get("target"),
-      dateFrom: searchParams.get("dateFrom") ?? undefined,
-      dateTo: searchParams.get("dateTo") ?? undefined,
+      mode: collectionModeValue(searchParams.get("mode") ?? searchParams.get("collectionMode")),
+      dateFrom: dateValue(searchParams.get("dateFrom")),
+      dateTo: dateValue(searchParams.get("dateTo")),
       windowDays: searchParams.get("windowDays") ?? undefined
     });
     return NextResponse.json(snapshot);
   } catch (error) {
-    return NextResponse.json({ error: errorMessage(error) }, { status: 500 });
+    return errorResponse(error);
   }
 }
 
@@ -48,21 +55,29 @@ export async function POST(request: Request) {
     const { searchParams } = new URL(request.url);
     const body = asRecord(await request.json().catch(() => ({})));
     const aiArticleLimit = firstValue(body.aiArticleLimit, searchParams.get("aiArticleLimit"));
+    const mode = collectionModeValue(
+      firstValue(
+        body.mode,
+        body.collectionMode,
+        searchParams.get("mode"),
+        searchParams.get("collectionMode")
+      )
+    );
     const refreshOptions = {
       limit: numberValue(firstValue(body.limit, searchParams.get("limit"))),
       dates: dateList(firstValue(body.dates, searchParams.get("dates"))),
       sourceDates: dateList(firstValue(body.sourceDates, searchParams.get("sourceDates"))),
       targetDates: dateList(firstValue(body.targetDates, searchParams.get("targetDates"))),
-      dateFrom: stringValue(firstValue(body.dateFrom, searchParams.get("dateFrom"))),
-      dateTo: stringValue(firstValue(body.dateTo, searchParams.get("dateTo"))),
-      sourceDateFrom: stringValue(
+      dateFrom: dateValue(firstValue(body.dateFrom, searchParams.get("dateFrom"))),
+      dateTo: dateValue(firstValue(body.dateTo, searchParams.get("dateTo"))),
+      sourceDateFrom: dateValue(
         firstValue(body.sourceDateFrom, searchParams.get("sourceDateFrom"))
       ),
-      sourceDateTo: stringValue(firstValue(body.sourceDateTo, searchParams.get("sourceDateTo"))),
-      targetDateFrom: stringValue(
+      sourceDateTo: dateValue(firstValue(body.sourceDateTo, searchParams.get("sourceDateTo"))),
+      targetDateFrom: dateValue(
         firstValue(body.targetDateFrom, searchParams.get("targetDateFrom"))
       ),
-      targetDateTo: stringValue(firstValue(body.targetDateTo, searchParams.get("targetDateTo"))),
+      targetDateTo: dateValue(firstValue(body.targetDateTo, searchParams.get("targetDateTo"))),
       sourceLookbackDays: numberValue(
         firstValue(body.sourceLookbackDays, searchParams.get("sourceLookbackDays")),
         7
@@ -70,6 +85,7 @@ export async function POST(request: Request) {
       maxPages: numberValue(firstValue(body.maxPages, searchParams.get("maxPages")), 12),
       maxArticles: numberValue(firstValue(body.maxArticles, searchParams.get("maxArticles")), 480),
       aiArticleLimit: numberValue(aiArticleLimit, 120),
+      useAi: !explicitFalse(firstValue(body.useAi, body.ai, searchParams.get("useAi"), searchParams.get("ai"))),
       sourceLanguage: firstValue(
         body.sourceLanguage,
         body.source,
@@ -83,19 +99,36 @@ export async function POST(request: Request) {
         searchParams.get("target")
       )
     };
+    const jpMajorOptions = {
+      dates: refreshOptions.dates ?? refreshOptions.targetDates,
+      dateFrom: refreshOptions.dateFrom ?? refreshOptions.targetDateFrom,
+      dateTo: refreshOptions.dateTo ?? refreshOptions.targetDateTo,
+      maxPages: refreshOptions.maxPages,
+      maxArticles: refreshOptions.maxArticles,
+      aiArticleLimit: refreshOptions.aiArticleLimit,
+      maxQueries: numberValue(firstValue(body.maxQueries, searchParams.get("maxQueries")), 12),
+      candidatesPerQuery: numberValue(
+        firstValue(body.candidatesPerQuery, searchParams.get("candidatesPerQuery")),
+        20
+      ),
+      useAi: refreshOptions.useAi
+    };
     const cacheTtlSeconds =
       numberValue(firstValue(body.cacheTtlSeconds, searchParams.get("cacheTtlSeconds"))) ?? 900;
     const forceRefresh = booleanValue(firstValue(body.forceRefresh, searchParams.get("forceRefresh")));
-    const signature = refreshOptionsSignature(refreshOptions);
-    const outputLockKey = refreshOutputLockKey(
-      refreshOptions.sourceLanguage,
-      refreshOptions.targetLanguage
-    );
+    const cacheSourceLanguage = mode === "jp-major" ? "CN" : refreshOptions.sourceLanguage;
+    const cacheTargetLanguage = mode === "jp-major" ? "JP" : refreshOptions.targetLanguage;
+    const signature =
+      mode === "jp-major"
+        ? jpMajorRefreshSignature(jpMajorOptions)
+        : refreshOptionsSignature(refreshOptions);
+    const outputLockKey = refreshOutputLockKey(cacheSourceLanguage, cacheTargetLanguage, mode);
 
     if (!forceRefresh && cacheTtlSeconds > 0) {
       const cached = await readSnapshot(undefined, {
-        sourceLanguage: refreshOptions.sourceLanguage,
-        targetLanguage: refreshOptions.targetLanguage
+        sourceLanguage: cacheSourceLanguage,
+        targetLanguage: cacheTargetLanguage,
+        mode
       });
       if (isFreshMatchingSnapshot(cached, signature, cacheTtlSeconds)) {
         return NextResponse.json(cached, {
@@ -144,11 +177,14 @@ export async function POST(request: Request) {
       );
     }
 
-    const refreshTask = refreshSnapshot(refreshOptions)
+    const refreshTask = (mode === "jp-major"
+      ? refreshJapaneseMajorSnapshot(jpMajorOptions)
+      : refreshSnapshot(refreshOptions)
+    )
       .then((snapshot) => writeSnapshot(snapshot))
-      .finally(() => {
+      .finally(async () => {
         inFlight.delete(outputLockKey);
-        void lock.release();
+        await lock.release();
       });
     inFlight.set(outputLockKey, { signature, promise: refreshTask });
     const archivedSnapshot = await refreshTask;
@@ -158,7 +194,7 @@ export async function POST(request: Request) {
       }
     });
   } catch (error) {
-    return NextResponse.json({ error: errorMessage(error) }, { status: 500 });
+    return errorResponse(error);
   }
 }
 
@@ -172,8 +208,16 @@ function firstValue(...values: unknown[]) {
   return values.find((value) => value !== undefined && value !== null && value !== "");
 }
 
-function stringValue(value: unknown) {
-  return typeof value === "string" ? value : undefined;
+function dateValue(value: unknown) {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new InvalidRequestError("日付はYYYY-MM-DD形式で指定してください。");
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new InvalidRequestError("実在する日付を指定してください。");
+  }
+  return value;
 }
 
 function numberValue(value: unknown, max?: number) {
@@ -190,19 +234,32 @@ function booleanValue(value: unknown) {
   return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 }
 
-function dateList(value: unknown) {
-  if (Array.isArray(value)) {
-    return value.filter((item): item is string => typeof item === "string");
-  }
-  if (typeof value !== "string") return undefined;
-  return value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
+function explicitFalse(value: unknown) {
+  if (value === false) return true;
+  if (typeof value !== "string") return false;
+  return ["0", "false", "no", "off"].includes(value.toLowerCase());
 }
 
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
+function collectionModeValue(value: unknown): "broad" | "jp-major" {
+  return collectionMode(value, defaultCollectionMode());
+}
+
+function dateList(value: unknown) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const list = Array.isArray(value) ? value : typeof value === "string" ? value.split(",").map((item) => item.trim()) : undefined;
+  if (!list) throw new InvalidRequestError("日付リストの形式が不正です。");
+  return list.map(dateValue).filter((date): date is string => Boolean(date));
+}
+
+class InvalidRequestError extends Error {}
+
+function errorResponse(error: unknown) {
+  if (error instanceof InvalidRequestError) {
+    return NextResponse.json({ error: error.message }, { status: 400 });
+  }
+  // Provider errors may embed API credentials or storage URLs. Never return
+  // raw exception text to the public endpoint.
+  return NextResponse.json({ error: "データの読込または更新に失敗しました。保存先・収集元の状態を確認してください。" }, { status: 500 });
 }
 
 function isFreshMatchingSnapshot(
@@ -226,9 +283,13 @@ function refreshLockName(signature: string) {
   return createHash("sha256").update(signature).digest("hex").slice(0, 32);
 }
 
-function refreshOutputLockKey(sourceLanguage: unknown, targetLanguage: unknown) {
+function refreshOutputLockKey(
+  sourceLanguage: unknown,
+  targetLanguage: unknown,
+  mode: "broad" | "jp-major" = "broad"
+) {
   const selection = resolveCompareLanguages({ sourceLanguage, targetLanguage });
-  return `${selection.sourceLanguage}-${selection.targetLanguage}`;
+  return `${mode}:${selection.sourceLanguage}-${selection.targetLanguage}`;
 }
 
 function refreshLockTtlMs() {

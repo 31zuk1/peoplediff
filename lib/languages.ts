@@ -78,6 +78,9 @@ export const PEOPLE_LANGUAGES: Record<PeopleLanguage, PeopleLanguageConfig> = {
     homeUrl: "https://j.people.com.cn/",
     articleHosts: ["j.people.com.cn", "j.peopledaily.com.cn"],
     allArticlesUrl: "https://j.people.com.cn/94765/index.html",
+    // The all-articles feed contains only 20 rows per page. Three pages cannot
+    // reliably reach the older dates revisited by the seven-day refresh cycle.
+    defaultDailyMaxPages: 12,
     warningLabel: "日本語版"
   },
   FR: {

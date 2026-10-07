@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "test": "node --import tsx --test tests/*.test.ts",
     "build": "next build",
     "start": "next start"
   },
@@ -13,7 +14,7 @@
     "clsx": "^2.1.1",
     "iconv-lite": "^0.6.3",
     "lucide-react": "^0.468.0",
-    "next": "^16.2.5",
+    "next": "^16.4.0",
     "openai": "^4.104.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
@@ -23,11 +24,12 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "autoprefixer": "^10.4.20",
-    "postcss": "^8.5.14",
+    "postcss": "^8.5.29",
     "tailwindcss": "^3.4.17",
+    "tsx": "^4.23.15",
     "typescript": "^5.7.2"
   },
   "overrides": {
-    "postcss": "^8.5.14"
+    "postcss": "^8.5.29"
   }
 }

@@ -9,6 +9,15 @@ export type ArticleMatch = {
 
 export type MatchCandidate = ArticleMatch;
 
+// A refresh compares each article many times. Cache immutable text features,
+// bounded across warm serverless invocations, rather than repeating the large
+// bilingual dictionaries and signal regular expressions for every pair.
+const normalizedTitleCache = new Map<string, string>();
+const signalCache = new Map<string, string[]>();
+const aliasCache = new Map<string, Set<string>>();
+const topicTokenCache = new Map<string, string[]>();
+const eventFeatureCache = new WeakMap<Article, EventFeatures>();
+
 export function matchArticles(baseArticles: Article[], targetArticles: Article[]) {
   const matches: ArticleMatch[] = [];
   const usedBase = new Set<string>();
@@ -134,6 +143,10 @@ export function targetOnlyStatus(target: Article): PairStatus {
 }
 
 export function scorePair(cn: Article, jp: Article) {
+  if (hasConflictingEventDates(cn, jp)) return 0;
+  const eventScore = eventEvidenceScore(cn, jp);
+  if (hasHardTopicMismatch(cn, jp)) return 0;
+  if (eventScore >= 0.62) return eventScore;
   const cnTitle = cn.translatedTitle || cn.title;
   const jpTitle = jp.translatedTitle || jp.title;
   const aliasedCnTitle = normalizeBilingualTitle(cnTitle);
@@ -178,8 +191,6 @@ export function scorePair(cn: Article, jp: Article) {
         )
       : 0;
   const strongSignal = signalScore >= 0.5 && (softTopicScore >= 0.12 || titleScore >= 0.08);
-
-  if (hasHardTopicMismatch(cn, jp)) return 0;
 
   if (unsharedCriticalSignal && titleScore < 0.72 && translatedTitleScore < 0.72) {
     return 0;
@@ -239,6 +250,8 @@ export function scorePair(cn: Article, jp: Article) {
 
 function looseScorePair(cn: Article, jp: Article) {
   if (hasHardTopicMismatch(cn, jp)) return 0;
+  const eventScore = eventEvidenceScore(cn, jp);
+  if (eventScore >= 0.62) return eventScore;
 
   const cnTitle = cn.translatedTitle || cn.title;
   const jpTitle = jp.translatedTitle || jp.title;
@@ -281,7 +294,7 @@ function looseScorePair(cn: Article, jp: Article) {
   const categoryScore = sameCategory ? 0.04 : 0;
 
   return Number(
-    Math.min(
+    Math.max(candidateRecallScore(cn, jp), Math.min(
       1,
       titleScore * 0.26 +
         aliasScore * 0.28 +
@@ -290,7 +303,7 @@ function looseScorePair(cn: Article, jp: Article) {
         softTopicScore * 0.18 +
         signalScore * 0.18 +
         categoryScore
-    ).toFixed(3)
+    )).toFixed(3)
   );
 }
 
@@ -428,6 +441,8 @@ function hasStrongSharedKeyword(cn: Article, jp: Article) {
 }
 
 function normalizeBilingualTitle(input: string) {
+  const cached = normalizedTitleCache.get(input);
+  if (cached !== undefined) return cached;
   const aliases: Array<[RegExp, string]> = [
     [/进攻型导弹|攻撃型ミサイル|導弾/g, "攻撃型ミサイル"],
     [/日本/g, "日本"],
@@ -530,16 +545,22 @@ function normalizeBilingualTitle(input: string) {
     [/悬崖|崖/g, "崖"]
   ];
 
-  return aliases.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), input);
+  return rememberFeature(
+    normalizedTitleCache,
+    input,
+    aliases.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), input)
+  );
 }
 
 function topicTokens(input: string) {
-  return normalizeBilingualTitle(input)
+  const cached = topicTokenCache.get(input);
+  if (cached) return cached;
+  return rememberFeature(topicTokenCache, input, normalizeBilingualTitle(input)
     .normalize("NFKC")
     .split(/[^\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{L}\p{N}ー]+/gu)
     .flatMap((part) => part.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}ーA-Za-z0-9]{2,12}/gu) ?? [])
     .map(normalizeForMatch)
-    .filter((token) => token.length >= 2);
+    .filter((token) => token.length >= 2));
 }
 
 function tokenOverlap(left: string[], right: string[]) {
@@ -597,11 +618,13 @@ function signalOverlap(left: string, right: string) {
 }
 
 function signalTerms(input: string) {
+  const cached = signalCache.get(input);
+  if (cached) return cached;
   const text = normalizeBilingualTitle(input).normalize("NFKC");
-  return signalPatterns
+  return rememberFeature(signalCache, input, signalPatterns
     .filter(([pattern]) => pattern.test(text))
     .map(([, term]) => term)
-    .filter((term, index, all) => all.indexOf(term) === index);
+    .filter((term, index, all) => all.indexOf(term) === index));
 }
 
 const aliasTerms = [
@@ -903,8 +926,11 @@ function hasUnsharedSpecificSignal(cn: Article, jp: Article) {
 }
 
 function hasUnsharedCriticalSignal(cn: Article, jp: Article) {
-  const cnSignals = specificSignals(cn);
-  const jpSignals = specificSignals(jp);
+  // A detail present in only one summary is exactly what PeopleDiff should
+  // investigate; it cannot veto candidate retrieval. Reserve hard exclusions
+  // for subjects explicitly present in the headlines.
+  const cnSignals = new Set(signalTerms([cn.title, cn.translatedTitle].filter(Boolean).join(" ")));
+  const jpSignals = new Set(signalTerms([jp.title, jp.translatedTitle].filter(Boolean).join(" ")));
   return [...cnSignals, ...jpSignals].some(
     (signal) =>
       criticalExclusiveSignals.has(signal) &&
@@ -976,8 +1002,153 @@ export function titleLineageScore(cn: Article, jp: Article) {
 }
 
 function aliasSet(input: string) {
+  const cached = aliasCache.get(input);
+  if (cached) return cached;
   const normalized = normalizeBilingualTitle(input);
-  return new Set(aliasTerms.filter((term) => normalized.includes(term)));
+  return rememberFeature(aliasCache, input, new Set(aliasTerms.filter((term) => normalized.includes(term))));
+}
+
+function rememberFeature<T>(cache: Map<string, T>, key: string, value: T) {
+  if (cache.size >= 4096) cache.clear();
+  cache.set(key, value);
+  return value;
+}
+
+type EventFeatures = {
+  titleGrams: Set<string>;
+  bodyGrams: Set<string>;
+  eventDates: Set<string>;
+  quantities: Set<string>;
+  date?: number;
+};
+
+// Script variants are evidence-preserving normalization, not a translation.
+// In particular, a country name or a generic news word is never an event anchor.
+const scriptVariants = new Map(
+  "权権 盐塩 议議 决決 录録 记記 关関 会会 园園 门門 国国 东東 长長 龙竜 广広 气気 产産 车車 运運 输輸 贸貿 业業 经経 济済 资資 矿鉱 学学 术術 创創 设設 备備 现現 发発 观観 华華 总総 夺奪 进進 连連 对対 选選 获獲 银銀 铜銅 单単 数数 历歴 县県 场場 测測 试試 线線 马馬 尔爾 万万 亿億 计計 统統 报報 开開 庆慶 实実 终終 桥橋 铁鉄 湾湾 级級 组組 届回".split(" ").map((pair) => [pair[0], pair[1]])
+);
+const weakEventGrams = new Set([
+  "中国", "日本", "人民", "国際", "社会", "経済", "政治", "文化", "世界",
+  "全国", "発展", "最新", "今年", "国慶", "慶節", "連休", "観光", "旅行",
+  "更新", "新記", "記録", "増加", "成長", "第一", "初日", "開催", "代表"
+]);
+
+function normalizeEventText(text: string) {
+  return text.normalize("NFKC")
+    .replace(/使馆/g, "使館")
+    .replace(/侵闯/g, "侵入")
+    .replace(/纪录|记录/g, "記録")
+    .replace(/经济/g, "経済")
+    .replace(/[\p{Script=Han}]/gu, (char) => scriptVariants.get(char) ?? char);
+}
+
+function eventFeatures(article: Article): EventFeatures {
+  const cached = eventFeatureCache.get(article);
+  if (cached) return cached;
+  const title = normalizeEventText([article.title, article.translatedTitle].filter(Boolean).join(" "));
+  const titleGrams = new Set(
+    (title.match(/[\p{Script=Han}]{2,}/gu) ?? [])
+      .flatMap((part) => charNgrams(part, 2))
+      .filter((gram) => !weakEventGrams.has(gram))
+  );
+  const bodyGrams = new Set(
+    (normalizeEventText(article.body.slice(0, 1800)).match(/[\p{Script=Han}]{3,}/gu) ?? [])
+      .flatMap((part) => charNgrams(part, 3))
+      .filter((gram) => !/中国|日本|人民|新華/.test(gram))
+  );
+  const eventDates = eventDatesFromLead(article);
+  // Lead facts carry the concrete event. Limit background and footer numbers.
+  const lead = `${article.title}\n${article.body.slice(0, 1800)}`.normalize("NFKC").replace(/(?<=\d),(?=\d{3}(?:\D|$))/g, "");
+  const quantities = new Set<string>();
+  const pattern = /(\d+(?:\.\d+)?(?:[兆億亿万萬]\d*(?:\.\d+)?)?(?:[億亿万萬]\d*(?:\.\d+)?)?)\s*(%|パーセント|ヶ国|か国|カ国|国|届|回|标箱|標箱|TEU|平方メートル|平方米|トン|吨|噸|公里|キロメートル|km|亿元|億元|美元|ドル|元|人)/gi;
+  for (const match of lead.matchAll(pattern)) {
+    const value = parseQuantity(match[1]);
+    const unit = quantityUnit(match[2]);
+    if (value >= 2 && Number.isFinite(value)) quantities.add(`${unit}:${value}`);
+  }
+  const date = Date.parse(article.publishedDate || article.urlDate || "");
+  const features = { titleGrams, bodyGrams, eventDates, quantities, date: Number.isFinite(date) ? date : undefined };
+  eventFeatureCache.set(article, features);
+  return features;
+}
+
+function parseQuantity(text: string) {
+  let value = 0;
+  for (const match of text.matchAll(/(\d+(?:\.\d+)?)([万萬][億亿]|[兆億亿万萬]?)/g)) {
+    const scale = match[2] === "兆" || /[万萬][億亿]/.test(match[2]) ? 1e12 : /[億亿]/.test(match[2]) ? 1e8 : /[万萬]/.test(match[2]) ? 1e4 : 1;
+    value += Number(match[1]) * scale;
+  }
+  return Number(value.toPrecision(12));
+}
+
+function eventDatesFromLead(article: Article) {
+  const year = (article.publishedDate || article.urlDate || "").slice(0, 4);
+  const lead = article.body.slice(0, 600).normalize("NFKC")
+    .replace(/(?:新华社|人民网|本报)[^\n。]{0,70}?\d{1,2}月\d{1,2}日电/g, "")
+    .replace(/(?:\d{4}年)?\d{1,2}月\d{1,2}日\s*(?:配信|掲載|更新)/g, "")
+    .replace(/[「“]人民[網网](?:日本語版)?[」”][\s\S]*$/, "")
+    .replace(/《\s*人民日报[\s\S]*$/, "");
+  return new Set(
+    [...lead.matchAll(/(?:(\d{4})年\s*)?(\d{1,2})月(\d{1,2})日/g)]
+      .map((match) => `${match[1] || year || "unknown"}-${Number(match[2])}-${Number(match[3])}`)
+  );
+}
+
+function quantityUnit(unit: string) {
+  if (/^(%|パーセント)$/.test(unit)) return "percent";
+  if (/国$/.test(unit)) return "countries";
+  if (/^(届|回)$/.test(unit)) return "edition";
+  if (/^(标箱|標箱|TEU)$/i.test(unit)) return "containers";
+  if (/^(平方メートル|平方米)$/.test(unit)) return "area";
+  if (/^(トン|吨|噸)$/.test(unit)) return "tonnes";
+  if (/^(公里|キロメートル|km)$/i.test(unit)) return "distance";
+  if (/^(美元|ドル)$/.test(unit)) return "usd";
+  return unit;
+}
+
+function hasConflictingEventDates(base: Article, target: Article) {
+  const left = eventFeatures(base).eventDates;
+  const right = eventFeatures(target).eventDates;
+  return left.size > 0 && right.size > 0 && ![...left].some((date) => right.has(date));
+}
+
+/** Require both title subject evidence and independent, unit-aware body facts. */
+export function eventEvidenceScore(base: Article, target: Article) {
+  const left = eventFeatures(base);
+  const right = eventFeatures(target);
+  if (left.date !== undefined && right.date !== undefined && Math.abs(left.date - right.date) > 4 * 86400000) return 0;
+  const sharedTitle = [...left.titleGrams].filter((gram) => right.titleGrams.has(gram));
+  const sharedQuantities = [...left.quantities].filter((quantity) => right.quantities.has(quantity));
+  const sharedUnits = new Set(sharedQuantities.map((quantity) => quantity.split(":")[0]));
+  const sharedDate = [...left.eventDates].some((date) => right.eventDates.has(date));
+  if (left.eventDates.size && right.eventDates.size && !sharedDate) return 0;
+  const sharedBody = [...left.bodyGrams].filter((gram) => right.bodyGrams.has(gram)).length;
+  // A release can be retitled entirely in translation. Five independently
+  // equal quantities across multiple units, subject wording in the body, and
+  // the same event date form a stronger fingerprint than headline similarity.
+  if (sharedQuantities.length >= 5 && sharedUnits.size >= 2 && sharedBody >= 3 && sharedDate) return 0.78;
+  if (sharedTitle.length < 2) return 0;
+  const preciseQuantity = sharedQuantities.some((quantity) => {
+    const [unit, raw] = quantity.split(":");
+    const value = Number(raw);
+    return !["edition", "countries", "人"].includes(unit) &&
+      ((value >= 1000 && value % 100 !== 0) || !Number.isInteger(value));
+  });
+  if (!preciseQuantity && (sharedUnits.size < 2 || sharedTitle.length < 3)) return 0;
+  return Number(Math.min(0.86, 0.62 + Math.max(0, sharedTitle.length - 3) * 0.02 + Math.max(0, sharedQuantities.length - 1) * 0.03).toFixed(3));
+}
+
+// Broader body recall is only for the AI shortlist. It never independently
+// authorizes a heuristic match: translating headlines can change every noun.
+function candidateRecallScore(base: Article, target: Article) {
+  const left = eventFeatures(base);
+  const right = eventFeatures(target);
+  if (left.date !== undefined && right.date !== undefined && Math.abs(left.date - right.date) > 4 * 86400000) return 0;
+  const sharedBody = [...left.bodyGrams].filter((gram) => right.bodyGrams.has(gram)).length;
+  const sharedQuantities = [...left.quantities].filter((quantity) => right.quantities.has(quantity)).length;
+  const sharedDate = [...left.eventDates].some((date) => right.eventDates.has(date));
+  if (sharedBody < 3 || (!sharedQuantities && !sharedDate)) return 0;
+  return Math.min(0.55, 0.18 + sharedBody * 0.015 + sharedQuantities * 0.04);
 }
 
 function aliasOverlap(left: string, right: string) {
