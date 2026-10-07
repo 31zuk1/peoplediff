@@ -9,3 +9,4 @@ dist
 output
 data/snapshots/*.json
 !data/snapshots/.gitkeep
+*.tsbuildinfo

@@ -1,6 +1,6 @@
 import * as cheerio from "cheerio";
 import iconv from "iconv-lite";
-import type { Article, Source } from "./types";
+import type { Article, ScrapeCoverage, Source } from "./types";
 import { getPeopleLanguageConfig, PEOPLE_LANGUAGE_CODES } from "./languages";
 import { cleanText, compactSummary, extractKeywords, stableId, truncate } from "./text";
 
@@ -71,6 +71,13 @@ export async function scrapePeopleDetailed(source: Source, options: ScrapeOption
   const articles: Article[] = [];
   const seen = new Set<string>();
   const seenTitles = new Set<string>();
+  let bodyFailureCount = 0;
+  const articleLimitReached = selectedCandidates.length < candidates.length;
+  if (articleLimitReached && dateScope.length) {
+    warnings.push(
+      `${language.warningLabel}は記事数上限に達しました（候補${candidates.length}件中${selectedCandidates.length}件）。収集範囲は不完全です。`
+    );
+  }
 
   const scraped = await mapWithConcurrency(selectedCandidates, scrapeConcurrency(), async (candidate) => {
     const titleKey = cleanTitle(candidate.title);
@@ -80,6 +87,10 @@ export async function scrapePeopleDetailed(source: Source, options: ScrapeOption
     try {
       const article = await scrapeArticle(candidate, source);
       const articleTitleKey = cleanTitle(article.title);
+      if (!article.body) {
+        bodyFailureCount += 1;
+        warnings.push(`${language.warningLabel}本文を抽出できませんでした: ${candidate.title}`);
+      }
       if (
         article.title &&
         (dateScope.length > 0 || article.body.length > 80) &&
@@ -89,6 +100,7 @@ export async function scrapePeopleDetailed(source: Source, options: ScrapeOption
         return article;
       }
     } catch {
+      bodyFailureCount += 1;
       seenTitles.add(titleKey);
       warnings.push(`${language.warningLabel}本文取得失敗: ${candidate.title}`);
       return {
@@ -113,7 +125,32 @@ export async function scrapePeopleDetailed(source: Source, options: ScrapeOption
     if (article) articles.push(article);
   }
 
-  return { articles, warnings: trimWarnings(warnings) };
+  const datesWithArticles = [
+    ...new Set(
+      articles
+        .map((article) => article.urlDate || article.publishedDate)
+        .filter((date): date is string => Boolean(date))
+    )
+  ].sort();
+  const collection: ScrapeCoverage = {
+    attemptedPages: dailyCollection?.attemptedPages ?? 1,
+    successfulPages: dailyCollection?.successfulPages ?? 1,
+    failedPages: dailyCollection?.failedPages ?? 0,
+    listingParseFailureCount: dailyCollection?.listingParseFailureCount ?? 0,
+    candidateCount: candidates.length,
+    selectedCount: selectedCandidates.length,
+    articleCount: articles.length,
+    bodyFailureCount,
+    articleLimitReached: dateScope.length > 0 && articleLimitReached,
+    pageLimitReached: dailyCollection?.pageLimitReached ?? false,
+    earliestDiscoveredDate: dailyCollection?.earliestDiscoveredDate,
+    latestDiscoveredDate: dailyCollection?.latestDiscoveredDate,
+    requestedDates: dateScope,
+    datesWithArticles,
+    emptyDates: dateScope.filter((date) => !datesWithArticles.includes(date))
+  };
+
+  return { articles, warnings: trimWarnings(warnings), collection };
 }
 
 export async function searchPeopleChineseArticlesForTargets(
@@ -227,6 +264,10 @@ async function collectDailyCandidates(
   const warnings: string[] = [];
   let attemptedPages = 0;
   let successfulPages = 0;
+  let failedPages = 0;
+  let listingParseFailureCount = 0;
+  let pageLimitReached = false;
+  const discoveredDates = new Set<string>();
   const language = getPeopleLanguageConfig(source);
   const initialPages =
     source === "CN"
@@ -234,6 +275,7 @@ async function collectDailyCandidates(
       : targetDailySourcePages(source, options.maxPages);
   const pages = [...initialPages];
   const queuedPages = new Set(pages);
+  const linkedPages = new Set<string>();
   const earliest = dateScope.slice().sort()[0];
   const stoppedPageBases = new Set<string>();
   const stalePageCounts = new Map<string, number>();
@@ -248,6 +290,10 @@ async function collectDailyCandidates(
       const html = await fetchDecodedHtml(pageUrl);
       const $ = cheerio.load(html);
       successfulPages += 1;
+      $("a").each((_, element) => {
+        const linkedUrl = normalizeUrl($(element).attr("href"), pageUrl);
+        if (linkedUrl && queuedPages.has(linkedUrl)) linkedPages.add(linkedUrl);
+      });
       if (source !== "CN" && !language.allArticlesUrl && pageUrl === language.homeUrl) {
         for (const listingPage of discoverTargetListingPages($, pageUrl, source, options.maxPages)) {
           if (queuedPages.has(listingPage)) continue;
@@ -260,10 +306,17 @@ async function collectDailyCandidates(
         source === "JP" && pageUrl.includes("/94765/")
           ? collectJapaneseListingCandidates($, pageUrl)
           : collectCandidates($, pageUrl, source, pageUrl);
+      if (!pageCandidates.length) {
+        listingParseFailureCount += 1;
+        warnings.push(`${language.warningLabel}一覧から記事リンクを抽出できませんでした: ${pageUrl}`);
+        stoppedPageBases.add(pageInfo.baseUrl);
+        continue;
+      }
 
       let addedForDate = 0;
       for (const candidate of pageCandidates) {
         const date = candidate.urlDate || candidate.listDate;
+        if (date) discoveredDates.add(date);
         if (!dateScope.includes(date ?? "")) continue;
         if (!candidates.has(candidate.url)) {
           candidates.set(candidate.url, candidate);
@@ -272,18 +325,25 @@ async function collectDailyCandidates(
       }
 
       const dates = pageCandidates
-        .map((candidate) => candidate.listDate || candidate.urlDate)
-        .filter(Boolean)
+        .map((candidate) => candidate.urlDate || candidate.listDate)
+        .filter((date): date is string => Boolean(date))
         .sort();
       const newestOnPage = dates.at(-1);
       if (source !== "CN") {
         if (language.allArticlesUrl && newestOnPage && newestOnPage < earliest) break;
+        if (language.allArticlesUrl && pageInfo.pageNumber >= options.maxPages) {
+          pageLimitReached = hasNextListingPage($, pageUrl) || source !== "JP";
+        }
         continue;
       }
 
       if (newestOnPage && newestOnPage < earliest) {
         stoppedPageBases.add(pageInfo.baseUrl);
         continue;
+      }
+
+      if (pageInfo.pageNumber >= options.maxPages && pageUrl !== language.homeUrl) {
+        pageLimitReached = true;
       }
 
       if (pageInfo.pageNumber >= 2 && addedForDate === 0) {
@@ -294,13 +354,21 @@ async function collectDailyCandidates(
         stalePageCounts.set(pageInfo.baseUrl, 0);
       }
     } catch (error) {
-      if (isOptionalPaginationMiss(pageUrl, error)) {
+      if (isOptionalPaginationMiss(pageUrl, error) && !linkedPages.has(pageUrl)) {
         stoppedPageBases.add(pageInfo.baseUrl);
       } else {
+        failedPages += 1;
         warnings.push(`${getPeopleLanguageConfig(source).warningLabel}一覧取得失敗: ${pageUrl} (${errorMessage(error)})`);
       }
     }
   }
+
+  if (pageLimitReached) {
+    warnings.push(
+      `${language.warningLabel}は一覧ページ数上限に達しました。対象日の記事がまだ残っている可能性があります。`
+    );
+  }
+  const orderedDates = [...discoveredDates].sort();
 
   return {
     candidates: [...candidates.values()].sort(
@@ -308,7 +376,12 @@ async function collectDailyCandidates(
     ),
     warnings: trimWarnings(warnings),
     attemptedPages,
-    successfulPages
+    successfulPages,
+    failedPages,
+    listingParseFailureCount,
+    pageLimitReached,
+    earliestDiscoveredDate: orderedDates[0],
+    latestDiscoveredDate: orderedDates.at(-1)
   };
 }
 
@@ -377,15 +450,24 @@ function collectCandidates(
 }
 
 function collectJapaneseListingCandidates($: cheerio.CheerioAPI, pageUrl: string): Candidate[] {
-  const candidates = $(".list")
+  // Keep ranking/sidebar links out of the chronological feed: their newer
+  // dates can otherwise prevent stopping, or conceal a broken listing parser.
+  const main = $(".j-d2tuwen .left, main, #main, #content, .article-list, .news-list").first();
+  const anchors = main.length
+    ? main.find("a")
+    : $(".list h1 a, .list h2 a, .list h3 a, .list h4 a, .list .title a, .list .tit a");
+  const seen = new Set<string>();
+  const candidates = anchors
     .map((_, element) => {
-      const row = $(element);
-      const anchor = row.find("h3 a").first();
-      const title = cleanTitle(anchor.text());
+      const anchor = $(element);
+      const row = anchor.closest("li, article, .list, .item, .news-item");
+      const title = cleanTitle(anchor.text() || anchor.attr("title") || "");
       const url = normalizeUrl(anchor.attr("href"), pageUrl);
-      const listPublishedAt = cleanText(row.find(".time").first().text());
+      const time = row.find("time, .time, .date").first();
+      const listPublishedAt = cleanText(time.attr("datetime") || time.text());
 
-      if (!url || !title || !isLikelyArticleUrl(url, "JP")) return undefined;
+      if (!url || !title || !isLikelyArticleUrl(url, "JP") || seen.has(url)) return undefined;
+      seen.add(url);
 
       return {
         title,
@@ -401,6 +483,16 @@ function collectJapaneseListingCandidates($: cheerio.CheerioAPI, pageUrl: string
     .filter(Boolean) as Candidate[];
 
   return candidates.sort((a, b) => scoreCandidate(b, "JP") - scoreCandidate(a, "JP"));
+}
+
+function hasNextListingPage($: cheerio.CheerioAPI, pageUrl: string) {
+  const current = paginatedPageInfo(pageUrl);
+  return $("a").toArray().some((element) => {
+    const url = normalizeUrl($(element).attr("href"), pageUrl);
+    if (!url) return false;
+    const next = paginatedPageInfo(url);
+    return next.baseUrl === current.baseUrl && next.pageNumber > current.pageNumber;
+  });
 }
 
 async function queryPeopleSearch(query: string, limit: number): Promise<Candidate[]> {

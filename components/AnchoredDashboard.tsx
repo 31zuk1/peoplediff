@@ -25,6 +25,8 @@ import type {
   Source
 } from "@/lib/types";
 import StatusBadge from "./StatusBadge";
+import SnapshotStatus from "./SnapshotStatus";
+import CollectionModeLinks from "./CollectionModeLinks";
 
 type AnchorStatusFilter = "ALL" | "MATCHED" | "UNMATCHED" | "DIFF";
 
@@ -230,6 +232,19 @@ export default function AnchoredDashboard({
             {theme === "dark" ? "White" : "Dark"}
           </button>
         </header>
+
+        <CollectionModeLinks mode="jp-major" />
+        {"run" in initialData ? <SnapshotStatus data={initialData as RefreshResult} /> : null}
+        {"archiveDates" in initialData ? <form method="get" className="flex flex-wrap items-center gap-3 text-sm">
+          <input type="hidden" name="mode" value="jp-major" />
+          <label className="text-slate-400">保存日
+            <select name="date" defaultValue={initialData.activeDate ?? ""} className="ml-3 h-11 rounded border border-white/10 bg-slate-950 px-3 text-slate-200">
+              <option value="">直近7日</option>
+              {initialData.archiveDates?.map((date) => <option key={date} value={date}>{date}</option>)}
+            </select>
+          </label>
+          <button className="h-11 rounded border border-white/10 px-4 text-slate-200" type="submit">表示</button>
+        </form> : null}
 
         <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
           <Metric icon={Languages} label={`${anchorSource} anchors`} value={rows.length} />
@@ -590,7 +605,7 @@ function AnalysisPanel({
 }) {
   const analysis = row.analysis;
 
-  if (!analysis || row.status === "unmatched") {
+  if (!analysis || analysis.analysisStatus === "unavailable" || row.status === "unmatched") {
     return (
       <div className="border-t border-white/10 p-4 sm:p-5">
         <div className="grid gap-3 md:grid-cols-3">
@@ -598,7 +613,7 @@ function AnalysisPanel({
             label="接続状態"
             value={
               row.status === "matched"
-                ? "対応記事はありますが、差分分析はまだありません。"
+                ? "対応記事はありますが、本文・論調は未分析です。差分なしという判定ではありません。"
                 : "JP記事をアンカーとして残し、CN側の対応未検出として表示しています。"
             }
           />
@@ -906,15 +921,13 @@ function differenceKinds(row: AnchorRow) {
   if (row.status !== "matched") return [];
   const status = row.pairStatus ?? row.pair?.status;
   const analysis = row.analysis;
+  if (!analysis || analysis.analysisStatus === "unavailable") return [];
   const bodyScore = analysis?.bodyDifferenceScore ?? 0;
   const framingScore = analysis?.framingShiftScore ?? 0;
   const pointDiff = Boolean(
     analysis && (analysis.missingPoints.length > 0 || analysis.emphasizedPoints.length > 0)
   );
-  const bodyLengthDiff = row.cn
-    ? Math.abs((row.cn.body ?? "").length - (row.anchor.body ?? "").length) > 1800
-    : false;
-  const bodyDiff = status === "BODY DIFFERENCE" || bodyScore >= 35 || pointDiff || bodyLengthDiff;
+  const bodyDiff = status === "BODY DIFFERENCE" || bodyScore >= 35 || pointDiff;
   const framingDiff = status === "FRAMING SHIFT" || framingScore >= 55;
 
   return [

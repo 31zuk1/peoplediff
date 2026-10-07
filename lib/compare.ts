@@ -26,6 +26,7 @@ import { scrapePeopleDetailed, searchPeopleChineseArticlesForTargets } from "./s
 import {
   buildRefreshRunMetadata,
   createRefreshTelemetryState,
+  getOpenAiWarnings,
   logRefreshRun,
   withRefreshTelemetry
 } from "./telemetry";
@@ -46,6 +47,7 @@ type RefreshOptions = {
   maxPages?: number;
   maxArticles?: number;
   aiArticleLimit?: number;
+  useAi?: boolean;
   sourceLanguage?: unknown;
   targetLanguage?: unknown;
   source?: unknown;
@@ -100,23 +102,25 @@ async function refreshSnapshotWithTelemetry(
     sourceArticles = sourceSettled.value.articles;
     warnings.push(...sourceSettled.value.warnings);
   } else {
-    warnings.push(`${sourceConfig.warningLabel}の取得に失敗: ${sourceSettled.reason}`);
+    throw new Error(`${sourceConfig.warningLabel}の取得に失敗したため更新を中止しました。保存済みデータを維持します。`, { cause: sourceSettled.reason });
   }
 
   if (targetSettled.status === "fulfilled") {
     targetArticles = targetSettled.value.articles;
     warnings.push(...targetSettled.value.warnings);
   } else {
-    warnings.push(`${targetConfig.warningLabel}の取得に失敗: ${targetSettled.reason}`);
+    throw new Error(`${targetConfig.warningLabel}の取得に失敗したため更新を中止しました。保存済みデータを維持します。`, { cause: targetSettled.reason });
   }
 
   const aiArticleLimit = resolveAiArticleLimit(options.aiArticleLimit, limit, dateScope.length > 0);
+  const useAi = options.useAi !== false && aiArticleLimit > 0;
+  if (!useAi) telemetry.openaiConfigured = false;
   const enrichedTarget = await mapWithConcurrency(targetArticles, aiConcurrency(), (article, index) =>
-    enrichArticleForLanguage(article, languageSelection.targetLanguage, index < aiArticleLimit)
+    enrichArticleForLanguage(article, languageSelection.targetLanguage, useAi && index < aiArticleLimit)
   );
   if (languageSelection.sourceLanguage === "CN" && dateScope.length > 0) {
     const searched = await searchPeopleChineseArticlesForTargets(
-      enrichedTarget.slice(0, aiArticleLimit),
+      enrichedTarget.slice(0, aiArticleLimit || 32),
       {
         dates: sourceDateScope,
         maxQueries: 32,
@@ -131,9 +135,9 @@ async function refreshSnapshotWithTelemetry(
     enrichArticleForLanguage(article, languageSelection.sourceLanguage, false)
   );
 
-  const basePairs = await matchArticlePairs(enrichedSource, enrichedTarget, aiArticleLimit);
+  const basePairs = await matchArticlePairs(enrichedSource, enrichedTarget, aiArticleLimit, useAi && canUseOpenAI() ? adjudicateSameTopicMatch : null);
   const analyzedPairs = filterPairsByDateScope(
-    await enrichPairs(basePairs),
+    await enrichPairs(basePairs, useAi ? aiArticleLimit : 0),
     targetDateScope,
     explicitSourceDateScope
   );
@@ -145,11 +149,12 @@ async function refreshSnapshotWithTelemetry(
     analyzedPairs,
     languageSelection.targetLanguage
   );
+  warnings.push(...getOpenAiWarnings(telemetry));
 
   const result: RefreshResult = {
     generatedAt: new Date().toISOString(),
     mode: "live",
-    model: activeModelLabel(),
+    model: useAi ? activeModelLabel() : "local-heuristic",
     run: buildRefreshRunMetadata(telemetry, warnings.length),
     schemaVersion: 2,
     refreshSignature: refreshOptionsSignature(options),
@@ -160,6 +165,14 @@ async function refreshSnapshotWithTelemetry(
     sourceDateScope,
     targetDateScope,
     sourceLookbackDays,
+    collection: {
+      ...(sourceSettled.status === "fulfilled" && {
+        [languageSelection.sourceLanguage]: sourceSettled.value.collection
+      }),
+      ...(targetSettled.status === "fulfilled" && {
+        [languageSelection.targetLanguage]: targetSettled.value.collection
+      })
+    },
     baseArticles: visibleSourceArticles,
     targetArticles: visibleTargetArticles,
     cnArticles: visibleSourceArticles,
@@ -199,8 +212,9 @@ export function refreshOptionsSignature(options: RefreshOptions = {}) {
     maxPages: normalizedNumber(options.maxPages),
     maxArticles: normalizedNumber(options.maxArticles),
     aiArticleLimit: normalizedNumber(options.aiArticleLimit),
-    analysisDisplayLanguage: "ja-repair-v1",
-    cnSourceSet: "core-2026-05-08-scitech-no-big5-dynamic-stop-search-v2-all-analysis"
+    useAi: options.useAi !== false,
+    analysisDisplayLanguage: "ja-evidence-v2",
+    cnSourceSet: "core-2026-10-07-event-evidence-and-jp-coverage-v3"
   });
 }
 
@@ -228,16 +242,16 @@ export function emptySnapshot(): RefreshResult {
   };
 }
 
-async function enrichPairs(pairs: ArticlePair[]) {
+export async function enrichPairs(pairs: ArticlePair[], aiArticleLimit: number, analyze = analyzeDifference) {
   const matched = pairs
     .filter((pair) => pairBase(pair) && pairTarget(pair))
     .sort((a, b) => b.matchScore - a.matchScore);
   const replacementsById = new Map<string, ArticlePair[]>();
 
-  const analyzed = await mapWithConcurrency(matched, aiConcurrency(), async (pair) => {
+  const analyzed = await mapWithConcurrency(matched, aiConcurrency(), async (pair, index) => {
     const base = pairBase(pair)!;
     const target = pairTarget(pair)!;
-    const analysis = await analyzeDifference(base, target);
+    const analysis = await analyze(base, target, { useAi: index < aiArticleLimit });
     const analyzedPair = { ...pair, analysis };
     const replacement = isRejectedMatch(analyzedPair)
       ? splitRejectedPair(analyzedPair)
@@ -257,12 +271,13 @@ async function enrichArticleForLanguage(
   return enrichArticle({ ...article, source: language }, { useAi: useAi && language !== "JP" });
 }
 
-async function matchArticlePairs(
+export async function matchArticlePairs(
   sourceArticles: Article[],
   targetArticles: Article[],
-  aiArticleLimit: number
+  aiArticleLimit: number,
+  adjudicate: typeof adjudicateSameTopicMatch | null | undefined = canUseOpenAI() ? adjudicateSameTopicMatch : undefined
 ) {
-  if (!canUseOpenAI()) return matchArticles(sourceArticles, targetArticles);
+  if (!adjudicate) return matchArticles(sourceArticles, targetArticles);
 
   const adjudicationLimit = Math.min(targetArticles.length, Math.max(0, aiArticleLimit));
   const targetsForAdjudication = targetArticles.slice(0, adjudicationLimit);
@@ -271,9 +286,9 @@ async function matchArticlePairs(
       limit: 7,
       minScore: 0.08
     });
-    if (!candidates.length) return undefined;
+    if (!candidates.length) return { fallbackTarget: target };
 
-    const decision = await adjudicateSameTopicMatch(
+    const decision = await adjudicate(
       target,
       candidates.map((candidate) => ({
         baseId: candidate.base.id,
@@ -287,7 +302,7 @@ async function matchArticlePairs(
     }
 
     let selected = candidates.find((candidate) => candidate.base.id === decision.baseId);
-    if (!selected) return undefined;
+    if (!selected) return { fallbackTarget: target };
     const directTitleCandidate = bestDirectTitleCandidate(candidates, target);
     if (
       directTitleCandidate &&
@@ -316,6 +331,9 @@ async function matchArticlePairs(
     ...adjudicated
       .map((outcome) => outcome && "fallbackTarget" in outcome ? outcome.fallbackTarget : undefined)
       .filter((target): target is Article => Boolean(target)),
+    // A duplicate source chosen by AI can lose conflict resolution. Try its
+    // remaining conservative candidates rather than silently dropping it.
+    ...adjudicated.filter(isAdjudicatedMatch).map((match) => match.target),
     ...targetArticles.slice(adjudicationLimit)
   ]
     .filter((target, index, all) => all.findIndex((item) => item.id === target.id) === index)
@@ -500,6 +518,7 @@ function hasBodyDifference(pair: ArticlePair) {
   const target = pairTarget(pair);
   if (!base || !target) return false;
   const analysis = pair.analysis;
+  if (analysis?.analysisStatus === "unavailable") return false;
   const bodyScore = analysis?.bodyDifferenceScore ?? 0;
   const hasPointDiff = Boolean(
     analysis && (analysis.missingPoints.length > 0 || analysis.emphasizedPoints.length > 0)
@@ -508,8 +527,7 @@ function hasBodyDifference(pair: ArticlePair) {
   return (
     pair.status === "BODY DIFFERENCE" ||
     bodyScore >= 35 ||
-    hasPointDiff ||
-    Math.abs(base.body.length - target.body.length) > 1800
+    hasPointDiff
   );
 }
 
@@ -528,6 +546,7 @@ function isTargetOnlyPair(pair: ArticlePair) {
 function hasFramingShift(pair: ArticlePair) {
   if (!pairBase(pair) || !pairTarget(pair)) return false;
   const analysis = pair.analysis;
+  if (analysis?.analysisStatus === "unavailable") return false;
   const framingScore = analysis?.framingShiftScore ?? 0;
 
   return pair.status === "FRAMING SHIFT" || framingScore >= 55;
@@ -594,6 +613,7 @@ function resolveAiArticleLimit(
   articleLimit: number,
   hasDateScope: boolean
 ) {
+  if (input === 0) return 0;
   const configured =
     input && Number.isFinite(input)
       ? input

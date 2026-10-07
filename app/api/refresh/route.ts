@@ -6,6 +6,7 @@ import { refreshOptionsSignature, refreshSnapshot } from "@/lib/compare";
 import { jpMajorRefreshSignature, refreshJapaneseMajorSnapshot } from "@/lib/jp-major";
 import { resolveCompareLanguages } from "@/lib/languages";
 import { acquireSnapshotLock } from "@/lib/snapshot-store";
+import { collectionMode, defaultCollectionMode } from "@/lib/collection-mode";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -31,17 +32,17 @@ declare global {
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
-    const snapshot = await readSnapshot(searchParams.get("date") ?? undefined, {
+    const snapshot = await readSnapshot(dateValue(searchParams.get("date")), {
       sourceLanguage: searchParams.get("sourceLanguage") ?? searchParams.get("source"),
       targetLanguage: searchParams.get("targetLanguage") ?? searchParams.get("target"),
       mode: collectionModeValue(searchParams.get("mode") ?? searchParams.get("collectionMode")),
-      dateFrom: searchParams.get("dateFrom") ?? undefined,
-      dateTo: searchParams.get("dateTo") ?? undefined,
+      dateFrom: dateValue(searchParams.get("dateFrom")),
+      dateTo: dateValue(searchParams.get("dateTo")),
       windowDays: searchParams.get("windowDays") ?? undefined
     });
     return NextResponse.json(snapshot);
   } catch (error) {
-    return NextResponse.json({ error: errorMessage(error) }, { status: 500 });
+    return errorResponse(error);
   }
 }
 
@@ -67,16 +68,16 @@ export async function POST(request: Request) {
       dates: dateList(firstValue(body.dates, searchParams.get("dates"))),
       sourceDates: dateList(firstValue(body.sourceDates, searchParams.get("sourceDates"))),
       targetDates: dateList(firstValue(body.targetDates, searchParams.get("targetDates"))),
-      dateFrom: stringValue(firstValue(body.dateFrom, searchParams.get("dateFrom"))),
-      dateTo: stringValue(firstValue(body.dateTo, searchParams.get("dateTo"))),
-      sourceDateFrom: stringValue(
+      dateFrom: dateValue(firstValue(body.dateFrom, searchParams.get("dateFrom"))),
+      dateTo: dateValue(firstValue(body.dateTo, searchParams.get("dateTo"))),
+      sourceDateFrom: dateValue(
         firstValue(body.sourceDateFrom, searchParams.get("sourceDateFrom"))
       ),
-      sourceDateTo: stringValue(firstValue(body.sourceDateTo, searchParams.get("sourceDateTo"))),
-      targetDateFrom: stringValue(
+      sourceDateTo: dateValue(firstValue(body.sourceDateTo, searchParams.get("sourceDateTo"))),
+      targetDateFrom: dateValue(
         firstValue(body.targetDateFrom, searchParams.get("targetDateFrom"))
       ),
-      targetDateTo: stringValue(firstValue(body.targetDateTo, searchParams.get("targetDateTo"))),
+      targetDateTo: dateValue(firstValue(body.targetDateTo, searchParams.get("targetDateTo"))),
       sourceLookbackDays: numberValue(
         firstValue(body.sourceLookbackDays, searchParams.get("sourceLookbackDays")),
         7
@@ -84,6 +85,7 @@ export async function POST(request: Request) {
       maxPages: numberValue(firstValue(body.maxPages, searchParams.get("maxPages")), 12),
       maxArticles: numberValue(firstValue(body.maxArticles, searchParams.get("maxArticles")), 480),
       aiArticleLimit: numberValue(aiArticleLimit, 120),
+      useAi: !explicitFalse(firstValue(body.useAi, body.ai, searchParams.get("useAi"), searchParams.get("ai"))),
       sourceLanguage: firstValue(
         body.sourceLanguage,
         body.source,
@@ -109,7 +111,7 @@ export async function POST(request: Request) {
         firstValue(body.candidatesPerQuery, searchParams.get("candidatesPerQuery")),
         20
       ),
-      useAi: !explicitFalse(firstValue(body.useAi, body.ai, searchParams.get("useAi"), searchParams.get("ai")))
+      useAi: refreshOptions.useAi
     };
     const cacheTtlSeconds =
       numberValue(firstValue(body.cacheTtlSeconds, searchParams.get("cacheTtlSeconds"))) ?? 900;
@@ -180,9 +182,9 @@ export async function POST(request: Request) {
       : refreshSnapshot(refreshOptions)
     )
       .then((snapshot) => writeSnapshot(snapshot))
-      .finally(() => {
+      .finally(async () => {
         inFlight.delete(outputLockKey);
-        void lock.release();
+        await lock.release();
       });
     inFlight.set(outputLockKey, { signature, promise: refreshTask });
     const archivedSnapshot = await refreshTask;
@@ -192,7 +194,7 @@ export async function POST(request: Request) {
       }
     });
   } catch (error) {
-    return NextResponse.json({ error: errorMessage(error) }, { status: 500 });
+    return errorResponse(error);
   }
 }
 
@@ -206,8 +208,16 @@ function firstValue(...values: unknown[]) {
   return values.find((value) => value !== undefined && value !== null && value !== "");
 }
 
-function stringValue(value: unknown) {
-  return typeof value === "string" ? value : undefined;
+function dateValue(value: unknown) {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new InvalidRequestError("日付はYYYY-MM-DD形式で指定してください。");
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new InvalidRequestError("実在する日付を指定してください。");
+  }
+  return value;
 }
 
 function numberValue(value: unknown, max?: number) {
@@ -231,34 +241,25 @@ function explicitFalse(value: unknown) {
 }
 
 function collectionModeValue(value: unknown): "broad" | "jp-major" {
-  if (typeof value !== "string") return defaultCollectionMode();
-  const normalized = value.trim().toLowerCase();
-  if (/^(broad|legacy|wide)$/i.test(normalized)) return "broad";
-  if (/^(jp-major|jp_major|anchored|jp-anchored|jp_anchor|jp-anchor)$/i.test(normalized)) {
-    return "jp-major";
-  }
-  return defaultCollectionMode();
-}
-
-function defaultCollectionMode(): "broad" | "jp-major" {
-  const configured = process.env.PEOPLEDIFF_DEFAULT_MODE;
-  if (!configured) return "jp-major";
-  return /^(broad|legacy|wide)$/i.test(configured) ? "broad" : "jp-major";
+  return collectionMode(value, defaultCollectionMode());
 }
 
 function dateList(value: unknown) {
-  if (Array.isArray(value)) {
-    return value.filter((item): item is string => typeof item === "string");
-  }
-  if (typeof value !== "string") return undefined;
-  return value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
+  if (value === undefined || value === null || value === "") return undefined;
+  const list = Array.isArray(value) ? value : typeof value === "string" ? value.split(",").map((item) => item.trim()) : undefined;
+  if (!list) throw new InvalidRequestError("日付リストの形式が不正です。");
+  return list.map(dateValue).filter((date): date is string => Boolean(date));
 }
 
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
+class InvalidRequestError extends Error {}
+
+function errorResponse(error: unknown) {
+  if (error instanceof InvalidRequestError) {
+    return NextResponse.json({ error: error.message }, { status: 400 });
+  }
+  // Provider errors may embed API credentials or storage URLs. Never return
+  // raw exception text to the public endpoint.
+  return NextResponse.json({ error: "データの読込または更新に失敗しました。保存先・収集元の状態を確認してください。" }, { status: 500 });
 }
 
 function isFreshMatchingSnapshot(

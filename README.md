@@ -1,6 +1,8 @@
 # PeopleDiff
 
-PeopleDiffは、日本語版「人民日報の主要ニュース」を起点に、対応する中国語版原稿を探索し、人民網の対外発信における記事選択・本文量・政治表現・フレーミング差分を観測するPoCダッシュボードです。
+PeopleDiffは、中国語版と対象言語版を比較し、人民網の対外発信における記事選択・本文量・政治表現・フレーミング差分を観測するダッシュボードです。全体比較に加え、日本語版「人民日報の主要ニュース」だけを起点に原稿を探索するモードも利用できます。
+
+2026-10-07の収集・照合・監視の修正はローカル検証段階で、本番には未反映です。以下の動作説明はこのチェックアウトの実装を対象とします。本番への反映にはVercelの再認証、AI分析の復旧には本番APIキーのクレジット・利用上限の確認が必要です。詳しくは[調査記録](docs/retrospectives/2026-10-07-production-repair.md)を参照してください。
 
 これは翻訳ビューアではありません。記事が「翻訳されたか」だけでなく、「どの記事が対外向けに選ばれたか」「同じ話題でも本文・論点・政治表現がどう変わったか」を見るためのOSINT / policy intelligence UIです。
 
@@ -9,7 +11,7 @@ PeopleDiffは、日本語版「人民日報の主要ニュース」を起点に�
 - 日本語版「人民日報の主要ニュース」から記事一覧・本文を深く取得するJPアンカーモード
 - 日本語記事ごとに人民網中国語版の検索API候補を探索し、本文・見出し・日付・固有名詞でスコアリング
 - 対応する中国語版が見つからない記事は `unmatched` として保持
-- 旧来の中国語版を基準にした対象言語切替（`mode=broad` で利用）
+- 中国語版を基準にした対象言語切替（既定の `mode=broad` で利用）
 - cheerioによる本文、日時、カテゴリ、URL抽出
 - OpenAI APIによる中国語/対象言語タイトルの日本語化、要約、本文差分分析
 - JP起点ペア内での `BODY DIFF` / `FRAMING` 補助バッジ
@@ -19,13 +21,13 @@ PeopleDiffは、日本語版「人民日報の主要ニュース」を起点に�
 
 ## Collection Modes
 
-既定は `jp-major` です。これは [人民網日本語版「人民日報の主要ニュース」](https://j.people.com.cn/95958/index.html) の記事をアンカーにして、対応する中国語版記事を探す設計です。PoC段階では大量の `JP ONLY` / `CN ONLY` を並べるより、JP記事ごとの対応関係の精度を優先します。
+既定は既存の本番アーカイブを引き継ぐ `broad` です。画面上の収集対象、または `/?mode=jp-major` でJPアンカーモードを選べます。これは [人民網日本語版「人民日報の主要ニュース」](https://j.people.com.cn/95958/index.html) の記事をアンカーにして、対応する中国語版記事を探す設計です。PoC段階では大量の `JP ONLY` / `CN ONLY` を並べるより、JP記事ごとの対応関係の精度を優先します。
 
-旧来の広域収集は残してあります。APIや環境変数で `mode=broad` または `PEOPLEDIFF_DEFAULT_MODE=broad` を指定すると、従来のCN/対象言語一覧を並べて照合するモードになります。
+`broad` はCN/対象言語の一覧を照合し、片側掲載を含む全体像を表示します。`jp-major` は特定の日本語欄に限定した探索で、両モードの保存先は別です。既定画面を変える場合は `PEOPLEDIFF_DEFAULT_MODE`、定期取得対象は `PEOPLEDIFF_CRON_MODE` を明示してください。空のJPアンカーアーカイブへの意図しない切替を避けるため、自動移行はしません。
 
 ## Language Coverage
 
-PeopleDiffの本番既定はJPアンカーです。広域比較モードでは、基準言語は現時点では中国語版（CN）固定です。対象言語はUIから切り替えられ、`CN -> target` の1:1比較として動きます。
+PeopleDiffの本番既定は広域比較です。このモードでは、基準言語は現時点では中国語版（CN）固定です。対象言語はUIから切り替えられ、`CN -> target` の1:1比較として動きます。
 
 人民網の外語チャンネルとして、2025年4月時点で英、法、俄、阿、西、日、韓、独、葡、スワヒリ、伊、カザフ（キリル）、タイ、マレー、ギリシャ、ベトナム、ウルドゥー、ヒンディーの18言語が確認できます。人民網サイトマップには、これとは別に蒙文、藏文、维文、哈文、朝鲜文、彝文、壮文などの民族語版も掲載されています。
 
@@ -49,7 +51,7 @@ npm install
 cp .env.example .env.local
 ```
 
-`.env.local` にOpenAI API keyを入れます。
+AI分析を利用する場合は、`.env.local` にOpenAI API keyを入れます。キーがなくても収集とルールによる照合は利用できます。
 
 ```bash
 OPENAI_API_KEY=sk-...
@@ -80,9 +82,9 @@ PEOPLEDIFF_BLOB_PREFIX=snapshots/
 PEOPLEDIFF_ADMIN_TOKEN=change-me
 CRON_SECRET=change-me-too
 
-# Defaults to jp-major. Set to broad only for the older wide collection.
-PEOPLEDIFF_DEFAULT_MODE=jp-major
-PEOPLEDIFF_CRON_MODE=jp-major
+# Defaults to broad; opt into jp-major explicitly.
+PEOPLEDIFF_DEFAULT_MODE=broad
+PEOPLEDIFF_CRON_MODE=broad
 
 # Optional. Comma/space-separated cron target languages. Defaults to JP.
 # In jp-major mode, cron intentionally refreshes JP only.
@@ -122,6 +124,7 @@ npm run dev
 
 ```bash
 npm run dev
+npm test
 npm run build
 npm run start
 ```
@@ -137,6 +140,8 @@ API keyがある場合は、以下が有効になります。
 - 中国語本文の簡易要約
 - 基準言語/対象言語の本文比較
 - 消えている論点、強調されている論点、論調差分、政治表現差分のJSON生成
+
+AI整形の対象はモードと上限に依存します。広域比較ではCN記事の全件翻訳や、すでに日本語のJP記事のAI再要約を行わず、非JP対象言語の日本語化、候補の同一話題判定、成立したペアの本文分析を優先します。JPアンカーモードでは探索候補の中国語記事もAI整形の対象です。キーを設定していてもAPIが失敗した場合、本文・論調差分は未分析として表示します。
 
 ## UIの見方
 
@@ -183,7 +188,7 @@ curl "http://localhost:3000/api/refresh?date=2026-05-07&targetLanguage=EN"
 
 最新スナップショットを返します。
 
-既定ではJPアンカーモードを返します。旧広域モードを見る場合は `mode=broad` を付けます。
+既定では広域比較を返します。JPアンカーモードを見る場合は `mode=jp-major` を付けます。最新表示はJST基準で前日までの7暦日です。未保存日を過去の別日で埋めず、`health.missingDates` で区別します。
 
 ### `GET /api/refresh?date=YYYY-MM-DD`
 
@@ -225,18 +230,20 @@ curl -X POST "http://localhost:3000/api/refresh" \
 
 `dates` に `["2026-05-07", "2026-05-06"]` のような配列を渡すこともできます。JPアンカーモードではこれは日本語版「人民日報の主要ニュース」の掲載日フィルタです。
 
-`dates` / `dateFrom` / `dateTo` を省略した場合は、95958の先頭ページ中心の小さなサンプル取得になります。旧来の広域収集を呼ぶ場合は `{"mode":"broad","targetLanguage":"EN"}` のように指定します。
+JPアンカーモードで `dates` / `dateFrom` / `dateTo` を省略した場合は、95958の先頭ページ中心の小さなサンプル取得になります。広域収集を明示する場合は `{"mode":"broad","targetLanguage":"EN"}` のように指定します。
 
 ### `GET /api/cron/refresh`
 
-Vercel Cron向けの更新APIです。`CRON_SECRET` を `Authorization: Bearer <secret>` で受け取り、既定ではJPアンカーモードで当日分を更新します。`/api/cron/refresh/0` から `/api/cron/refresh/6` をスケジュールしておくと、毎日直近7日分のスナップショットが補充され、公開画面は保存済みの直近7日を集約表示します。
+Vercel Cron向けの更新APIです。`CRON_SECRET` を `Authorization: Bearer <secret>` で受け取り、既定では広域比較で前日分を更新します。`/api/cron/refresh/0` から `/api/cron/refresh/6` をスケジュールしておくと、毎日直近7日分のスナップショットが補充され、公開画面は前日までの7暦日を集約表示します。未保存日は別の日で補いません。
 
 ```bash
 curl "http://localhost:3000/api/cron/refresh" \
   -H "Authorization: Bearer $CRON_SECRET"
 ```
 
-本番では `vercel.json` に `/api/cron/refresh/0` から `/api/cron/refresh/6` まで7本のcronを登録しています。各ジョブはJST基準の今日から6日前までを1日ずつ更新し、公開GETは保存済み日別snapshotの直近7日分をマージして返します。7日分を1回でスクレイプするとVercelの関数時間上限に当たりやすいため、意図的に日別分割しています。
+`vercel.json` には `/api/cron/refresh/0` から `/api/cron/refresh/6` まで7本のcronを定義しています。この実装をデプロイすると、各ジョブはJST基準の前日から7日前までを1日ずつ更新し、公開GETも同じ7暦日を集約します。offset 0 は前日、offset 6 は7日前です。当日午前1時の未掲載記事を空で保存する設計を避け、公開日の後に初回取得します。7日分を1回でスクレイプするとVercelの関数時間上限に当たりやすいため、意図的に日別分割しています。
+
+AI失敗や収集警告がある場合は、HTTP 200でも `status: degraded` と個別の `health` / `aiStatus` を返します。更新自体の失敗は500です。HTTPステータスだけで全工程の正常性を判断しないでください。
 
 ## Project Structure
 
@@ -327,7 +334,7 @@ curl -i "https://<preview-host>/api/cron/refresh" \
 - Blobに `latest.jp-major.CN-JP.json`、日付snapshot、`index.jp-major.CN-JP.json` が作成される
 - 日付指定GETで保存済みsnapshotが読める
 
-cronは日別に分割してJPアンカー記事を更新します。各日別ジョブが `maxDuration=300` に収まるように、まずは `PEOPLEDIFF_JP_MAJOR_MAX_PAGES`、`PEOPLEDIFF_JP_MAJOR_MAX_ARTICLES`、`PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT` を小さめに始めてください。Vercel Hobbyではcronごとの実行は1日1回までですが、プロジェクトあたり100 cron jobsまで使えるため、7本の日別cronでローリング1週間を維持します。
+cronは日別に分割し、選択したモードの記事を更新します。各日別ジョブが `maxDuration=300` に収まるように、まずは `PEOPLEDIFF_JP_MAJOR_MAX_PAGES`、`PEOPLEDIFF_JP_MAJOR_MAX_ARTICLES`、`PEOPLEDIFF_CRON_AI_ARTICLE_LIMIT` を小さめに始めてください。Vercel Hobbyではcronごとの実行は1日1回までですが、プロジェクトあたり100 cron jobsまで使えるため、7本の日別cronでローリング1週間を維持します。
 
 ## Current Limitations
 
@@ -348,3 +355,22 @@ PeopleDiffの目的は「翻訳の有無」を見ることではなく、言語�
 - 中国語版にはあるが、対象言語版にはない話題は何か
 - 同じ話題でも、対象言語版で消える/強調される論点は何か
 - 対外向けに政治表現やフレーミングがどう変わるか
+
+
+## Collection and Analysis Health
+
+- `GET /api/health`: 本文を返さず、保存日時・記事日付・日別件数・AI状態・欠測日を返します。スナップショットなし／36時間以上更新なし／保存層障害は503、利用可能なデータに分析警告がある場合は200かつ `status: degraded` です。
+- `GET /api/refresh` は `health`、`dailyUpdates`、言語別 `collection` を含みます。収集上限・一覧解析失敗・本文取得失敗を、正当に掲載のない日と区別できます。旧アーカイブには診断値が存在しないため、再取得するまで原因は推定しません。
+- `run.openaiAttempts` / `openaiCalls` / `openaiFailures` / `openaiCacheHits` / `openaiSkipped` を分離しています。`openaiCalls` は有効なJSON応答に成功した回数です。トークン数には形式不正の応答で消費した分も含みます。
+- 認証・残高・レート制限・設定エラーでは、その実行の以降のAI送信を停止します。修復後の次回更新で自動的に再試行します。機密を含むproviderの生エラーは公開しません。
+- AIが使えなくても本文の数値・単位・固有語・日付で保守的に照合します。単独の人数や単一の丸い数、人物・行為・日付の一致だけを追加の自動確定根拠にはせず、日付の年や単位の桁も確認します。`MATCHED` とAI差分分析の完了は別です。`analysis.analysisStatus: unavailable` は未分析であり、差分なしではありません。
+- 認証付きPOSTの `useAi: false` または `aiArticleLimit: 0` はAIを使わず更新します。
+- 不完全な収集結果が既存の日別アーカイブを空または少ない記事で置き換える場合は保存を拒否します。
+
+既存の公開JSONをローカルで照合し直す場合は、ネットワーク取得もAI課金も行わない回復コマンドを利用できます。出力先は新しいファイルを指定してください。本番Blobや入力ファイルには書き込みません。
+
+```bash
+node --import tsx scripts/reanalyze-snapshot.ts /absolute/path/input.json /absolute/path/reanalyzed.json
+```
+
+2026-10-07の原因分析、再現結果、リリース時の確認事項は [調査記録](docs/retrospectives/2026-10-07-production-repair.md) を参照してください。

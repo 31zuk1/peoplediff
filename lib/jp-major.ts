@@ -18,6 +18,7 @@ import { JP_MAJOR_NEWS_URL, scrapeJapaneseMajorNews } from "./jp-major-scraper";
 import {
   buildRefreshRunMetadata,
   createRefreshTelemetryState,
+  getOpenAiWarnings,
   logRefreshRun,
   withRefreshTelemetry
 } from "./telemetry";
@@ -75,18 +76,23 @@ async function refreshJapaneseMajorSnapshotWithTelemetry(
     options.candidatesPerQuery ??
     numberFromEnv("PEOPLEDIFF_JP_MAJOR_CANDIDATES_PER_QUERY") ??
     8;
+  const useAi = options.useAi !== false && aiArticleLimit > 0;
+  if (!useAi) telemetry.openaiConfigured = false;
   const scraped = await scrapeJapaneseMajorNews({
     dates: dateScope,
     maxPages,
     maxArticles
   });
   const warnings = [...scraped.warnings];
+  if (!scraped.articles.length && (warnings.length || !scraped.pagesVisited.length)) {
+    throw new Error("JP主要ニュースの取得を確認できないため、空の結果でアーカイブを上書きしませんでした。");
+  }
   const enrichedJp = await mapWithConcurrency(scraped.articles, 6, (article, index) =>
-    enrichJapaneseArticle(article, { useAi: index < aiArticleLimit })
+    enrichJapaneseArticle(article, { useAi: useAi && index < aiArticleLimit })
   );
 
   const anchoredPairs = await mapWithConcurrency(enrichedJp, 3, async (jpArticle, index) => {
-    const useAiForArticle = options.useAi !== false && index < aiArticleLimit;
+    const useAiForArticle = useAi && index < aiArticleLimit;
     const match = await findChineseMatchForJapaneseArticle(jpArticle, {
       dates: dateScope,
       maxQueries,
@@ -102,11 +108,12 @@ async function refreshJapaneseMajorSnapshotWithTelemetry(
   const pairs = anchoredPairs.map(articlePairFromAnchoredPair);
   const cnArticles = uniqueArticles(anchoredPairs.map((pair) => pair.cn).filter(isArticle));
   const jpArticles = uniqueArticles(anchoredPairs.map((pair) => pair.jp));
+  warnings.push(...getOpenAiWarnings(telemetry));
   const result: RefreshResult = {
     generatedAt: new Date().toISOString(),
     mode: "live",
     collectionMode: "jp-major",
-    model: activeModelLabel(),
+    model: useAi ? activeModelLabel() : "local-heuristic",
     run: buildRefreshRunMetadata(telemetry, warnings.length),
     schemaVersion: 2,
     refreshSignature: jpMajorRefreshSignature(options),
@@ -114,9 +121,9 @@ async function refreshJapaneseMajorSnapshotWithTelemetry(
     targetLanguage: "JP",
     availableLanguages: getAvailableLanguageSummaries(),
     anchorSourceUrl: JP_MAJOR_NEWS_URL,
-    dateScope: collectDateScope(jpArticles),
-    sourceDateScope: collectDateScope(cnArticles),
-    targetDateScope: collectDateScope(jpArticles),
+    dateScope: dateScope.length ? dateScope : collectDateScope(jpArticles),
+    sourceDateScope: dateScope.length ? dateScope : collectDateScope(cnArticles),
+    targetDateScope: dateScope.length ? dateScope : collectDateScope(jpArticles),
     sourceLookbackDays: 0,
     baseArticles: cnArticles,
     targetArticles: jpArticles,
@@ -265,8 +272,9 @@ function normalizeDateScope(input: string[] | undefined) {
 }
 
 function normalizeDate(input: string | undefined) {
-  if (!input) return undefined;
-  return input.match(/\d{4}-\d{2}-\d{2}/)?.[0];
+  if (!input || !/^\d{4}-\d{2}-\d{2}$/.test(input)) return undefined;
+  const date = new Date(`${input}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === input ? input : undefined;
 }
 
 function collectDateScope(articles: Article[]) {
@@ -328,7 +336,9 @@ function normalizedNumber(input: number | undefined) {
 }
 
 function numberFromEnv(name: string, options: { allowZero?: boolean } = {}) {
-  const value = Number(process.env[name]);
+  const raw = process.env[name];
+  if (!raw?.trim()) return undefined;
+  const value = Number(raw);
   const minimum = options.allowZero ? 0 : 1;
   return Number.isFinite(value) && value >= minimum ? Math.round(value) : undefined;
 }

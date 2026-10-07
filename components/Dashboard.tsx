@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
 import clsx from "clsx";
 import {
   Activity,
@@ -19,6 +19,8 @@ import {
 } from "lucide-react";
 import type { Article, ArticlePair, PairStatus, RefreshResult, Source } from "@/lib/types";
 import StatusBadge from "./StatusBadge";
+import SnapshotStatus from "./SnapshotStatus";
+import CollectionModeLinks from "./CollectionModeLinks";
 
 type Props = {
   initialData: RefreshResult;
@@ -66,14 +68,13 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
     initialData.targetLanguage ?? "JP"
   );
   const [selectedArchiveDate, setSelectedArchiveDate] = useState(initialData.activeDate ?? "LATEST");
-  const [dateFrom, setDateFrom] = useState(() => dateRangeFromScope(initialData.dateScope).from);
-  const [dateTo, setDateTo] = useState(() => dateRangeFromScope(initialData.dateScope).to);
+  const [dateFrom, setDateFrom] = useState(() => dateRangeFromScope(snapshotDates(initialData)).from);
+  const [dateTo, setDateTo] = useState(() => dateRangeFromScope(snapshotDates(initialData)).to);
   const [errorMessage, setErrorMessage] = useState("");
   const [cacheNotice, setCacheNotice] = useState("");
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [themeReady, setThemeReady] = useState(false);
   const [isPending, startTransition] = useTransition();
-  const snapshotCacheRef = useRef<Map<string, RefreshResult>>(new Map());
   const languageOptions = useMemo(() => getLanguageOptions(data), [data]);
   const baseLanguage = data.baseLanguage ?? "CN";
   const languagePair = useMemo(
@@ -86,14 +87,6 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
     if (saved === "light" || saved === "dark") setTheme(saved);
     setThemeReady(true);
   }, []);
-
-  useEffect(() => {
-    rememberClientSnapshot(snapshotCacheRef.current, initialData);
-  }, [initialData]);
-
-  useEffect(() => {
-    rememberClientSnapshot(snapshotCacheRef.current, data);
-  }, [data]);
 
   useEffect(() => {
     if (!themeReady) return;
@@ -109,10 +102,10 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
   }, [data.targetLanguage]);
 
   useEffect(() => {
-    const nextRange = dateRangeFromScope(data.dateScope);
+    const nextRange = dateRangeFromScope(snapshotDates(data));
     setDateFrom(nextRange.from);
     setDateTo(nextRange.to);
-  }, [data.dateScope, data.generatedAt]);
+  }, [data]);
 
   const filteredPairs = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -183,12 +176,6 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
     setSelectedId(next.pairs[0]?.id ?? "");
   }
 
-  function showCachedSnapshot(next: RefreshResult, nextTarget: Source, nextDate: string) {
-    setErrorMessage("");
-    setCacheNotice(`キャッシュから再表示: CN / ${nextTarget} ${snapshotScopeLabel(next, nextDate)}`);
-    showSnapshot(next);
-  }
-
   function refresh(nextTarget = targetLanguage) {
     const selectedDates = selectedDateScope;
     if (!selectedDates.length) return;
@@ -200,6 +187,7 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
+            mode: "broad",
             dates: selectedDates,
             targetDates: selectedDates,
             dateFrom,
@@ -207,7 +195,7 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
             sourceLookbackDays: 1,
             sourceLanguage: "CN",
             targetLanguage: nextTarget,
-            maxPages: 8,
+            maxPages: 12,
             maxArticles: 240,
             aiArticleLimit: 80,
             cacheTtlSeconds: 1800
@@ -231,22 +219,12 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
       setDateTo(nextDate);
     }
 
-    const cached = findClientSnapshot(snapshotCacheRef.current, {
-      sourceLanguage: "CN",
-      targetLanguage: nextTarget,
-      archiveDate: nextDate,
-      dates: nextDate !== "LATEST" ? [nextDate] : selectedDateScope
-    });
-    if (cached) {
-      showCachedSnapshot(cached, nextTarget, nextDate);
-      return;
-    }
-
     startTransition(async () => {
       setErrorMessage("");
       setCacheNotice("");
       try {
         const params = new URLSearchParams({
+          mode: "broad",
           sourceLanguage: "CN",
           targetLanguage: nextTarget
         });
@@ -259,6 +237,22 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
         showSnapshot(next);
       } catch (error) {
         setErrorMessage(`アーカイブの読み込みに失敗しました: ${readableError(error)}`);
+      }
+    });
+  }
+
+  function loadDateRange() {
+    if (!selectedDateScope.length) return;
+    startTransition(async () => {
+      setErrorMessage("");
+      setCacheNotice("");
+      try {
+        const params = new URLSearchParams({ mode: "broad", targetLanguage, dateFrom, dateTo });
+        const response = await fetch(`/api/refresh?${params}`, { cache: "no-store" });
+        showSnapshot(await parseSnapshotResponse(response));
+        setSelectedArchiveDate("LATEST");
+      } catch (error) {
+        setErrorMessage(`期間の読み込みに失敗しました: ${readableError(error)}`);
       }
     });
   }
@@ -284,9 +278,9 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
               <span className="rounded border border-white/10 bg-white/[0.03] px-2.5 py-1">
                 {formatDate(data.generatedAt)}
               </span>
-              {data.dateScope?.length ? (
+              {snapshotDates(data).length ? (
                 <span className="rounded border border-emerald-200/20 bg-emerald-300/10 px-2.5 py-1 text-emerald-100/80">
-                  対象期間 {formatScopeRange(data.dateScope)}
+                  対象期間 {formatScopeRange(snapshotDates(data))}
                 </span>
               ) : null}
               {data.run ? (
@@ -355,6 +349,9 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
           </div>
         </header>
 
+        <CollectionModeLinks mode="broad" />
+        <SnapshotStatus data={data} />
+
         <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
           <Metric
             icon={Globe2}
@@ -366,11 +363,11 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
             label={`Target ${languagePair.target.code}`}
             value={getSourceCount(data, languagePair.target.source)}
           />
-          <Metric icon={ShieldCheck} label="Coverage" value={`${data.stats.coverageRatio}%`} />
+          <Metric icon={ShieldCheck} label="CN対応率" value={`${data.stats.coverageRatio}%`} />
           <Metric
             icon={Sparkles}
             label="Diff pairs"
-            value={data.stats.framingShift + data.stats.bodyDifference}
+            value={data.pairs.filter((pair) => getDifferenceKinds(pair, languagePair).length > 0).length}
           />
           <Metric icon={Gauge} label="Date drift" value={data.stats.dateMismatches ?? 0} />
         </section>
@@ -393,7 +390,7 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
           </div>
         ) : null}
 
-        <section className="grid gap-2.5 border-y border-white/10 py-4 md:grid-cols-2 xl:grid-cols-[10.75rem_10.75rem_minmax(13rem,1fr)_18.75rem_10.5rem_11.5rem] xl:items-center">
+        <section className="grid gap-2.5 border-y border-white/10 py-4 md:grid-cols-2 xl:grid-cols-[10rem_10rem_6rem_minmax(10rem,1fr)_16rem_9rem_10rem] xl:items-center">
           <label className="relative block min-w-0">
             <input
               type="date"
@@ -420,6 +417,10 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
               aria-label="終了日"
             />
           </label>
+          <button type="button" onClick={loadDateRange} disabled={isPending || !selectedDateScope.length}
+            className="h-11 rounded-md border border-white/10 bg-white/[0.04] px-3 text-sm font-semibold text-slate-200 disabled:opacity-50">
+            期間を表示
+          </button>
           <label className="relative block min-w-0">
             <Search className={controlIconClass} />
             <input
@@ -493,6 +494,7 @@ export default function Dashboard({ initialData, allowRefresh = false }: Props) 
 
         {data.pairs.length === 0 ? (
           <EmptyState
+            hasSnapshot={data.mode !== "empty"}
             allowRefresh={allowRefresh}
             isPending={isPending}
             onRefresh={() => refresh()}
@@ -710,7 +712,7 @@ function ComparisonPanel({
   const baseArticle = getRoleArticle(pair, "base", languagePair);
   const targetArticle = getRoleArticle(pair, "target", languagePair);
   const displayStatus = getDisplayStatus(pair, languagePair);
-  const canShowAnalysis = Boolean(baseArticle && targetArticle && analysis);
+  const canShowAnalysis = Boolean(baseArticle && targetArticle && analysis && analysis.analysisStatus !== "unavailable");
   const showGeneratedMeta = shouldShowGeneratedMeta(pair, languagePair);
 
   return (
@@ -722,7 +724,7 @@ function ComparisonPanel({
             <DifferenceMarkers pair={pair} languagePair={languagePair} />
             <span className="text-xs text-slate-500">
               {baseArticle && targetArticle
-                ? `match ${Math.round(pair.matchScore * 100)}%`
+                ? `照合スコア ${Math.round(pair.matchScore * 100)}/100`
                 : "single-sided"}
             </span>
           </div>
@@ -790,7 +792,7 @@ function ComparisonPanel({
           </div>
         ) : (
           <div className="grid gap-3 md:grid-cols-3">
-            <NarrativeTile label={displayStatus.copy} value="このペアは未分析または片側のみの記事です。" />
+            <NarrativeTile label={baseArticle && targetArticle ? "本文・論調は未分析" : displayStatus.copy} value={baseArticle && targetArticle ? "対応する記事はありますが、AI分析は完了していません。差分なしという判定ではありません。" : "取得範囲内で対応する記事を検出できていません。"} />
             <NarrativeTile
               label="接続性"
               value={
@@ -941,10 +943,12 @@ function NarrativeTile({ label, value }: { label: string; value: string }) {
 }
 
 function EmptyState({
+  hasSnapshot,
   allowRefresh,
   isPending,
   onRefresh
 }: {
+  hasSnapshot: boolean;
   allowRefresh: boolean;
   isPending: boolean;
   onRefresh: () => void;
@@ -955,9 +959,9 @@ function EmptyState({
         <div className="mx-auto mb-4 grid h-12 w-12 place-items-center rounded border border-cyan-200/20 bg-cyan-300/10">
           <RefreshCw className={clsx("h-5 w-5 text-cyan-100", isPending && "animate-spin")} />
         </div>
-        <h2 className="text-xl font-semibold text-white">No snapshot</h2>
+        <h2 className="text-xl font-semibold text-white">{hasSnapshot ? "この期間の取得記事は0件" : "この期間の保存データがありません"}</h2>
         <p className="mt-2 text-sm leading-6 text-slate-400">
-          基準言語版と対象言語版の保存済みスナップショット待ちです。
+          {hasSnapshot ? "保存済みの収集結果は0件です。収集状態と対象日を確認してください。" : "日別の保存状況を確認するか、別の期間を選択してください。"}
         </p>
         {allowRefresh ? (
           <button
@@ -1072,77 +1076,14 @@ function readableError(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function rememberClientSnapshot(cache: Map<string, RefreshResult>, snapshot: RefreshResult) {
-  const sourceLanguage = snapshot.baseLanguage ?? "CN";
-  const targetLanguage = snapshot.targetLanguage ?? "JP";
-  const dates = snapshotDates(snapshot);
-
-  if (!snapshot.activeDate) {
-    cache.set(latestSnapshotKey(sourceLanguage, targetLanguage), snapshot);
-  }
-
-  if (snapshot.activeDate && isArchiveDate(snapshot.activeDate)) {
-    cache.set(datedSnapshotKey(sourceLanguage, targetLanguage, snapshot.activeDate), snapshot);
-  }
-
-  if (dates.length) {
-    cache.set(rangeSnapshotKey(sourceLanguage, targetLanguage, dates), snapshot);
-    if (dates.length === 1) {
-      cache.set(datedSnapshotKey(sourceLanguage, targetLanguage, dates[0]), snapshot);
-    }
-  }
-}
-
-function findClientSnapshot(
-  cache: Map<string, RefreshResult>,
-  options: {
-    sourceLanguage: Source;
-    targetLanguage: Source;
-    archiveDate: string;
-    dates: string[];
-  }
-) {
-  const dates = normalizeDateList(options.dates);
-  const keys =
-    options.archiveDate !== "LATEST"
-      ? [
-          datedSnapshotKey(options.sourceLanguage, options.targetLanguage, options.archiveDate),
-          dates.length ? rangeSnapshotKey(options.sourceLanguage, options.targetLanguage, dates) : "",
-          latestSnapshotKey(options.sourceLanguage, options.targetLanguage)
-        ]
-      : [
-          dates.length ? rangeSnapshotKey(options.sourceLanguage, options.targetLanguage, dates) : "",
-          latestSnapshotKey(options.sourceLanguage, options.targetLanguage)
-        ];
-
-  for (const key of keys) {
-    const snapshot = key ? cache.get(key) : undefined;
-    if (snapshot) return snapshot;
-  }
-
-  return undefined;
-}
-
 function snapshotDates(snapshot: RefreshResult) {
-  return normalizeDateList(snapshot.dateScope);
+  return normalizeDateList([...(snapshot.dateScope ?? []), ...(snapshot.health?.missingDates ?? [])]);
 }
 
 function snapshotScopeLabel(snapshot: RefreshResult, archiveDate: string) {
   if (archiveDate !== "LATEST") return archiveDate;
   const dates = snapshotDates(snapshot);
   return dates.length ? formatScopeRange(dates) : "LATEST";
-}
-
-function latestSnapshotKey(sourceLanguage: Source, targetLanguage: Source) {
-  return `latest:${sourceLanguage}:${targetLanguage}`;
-}
-
-function datedSnapshotKey(sourceLanguage: Source, targetLanguage: Source, date: string) {
-  return `date:${sourceLanguage}:${targetLanguage}:${date}`;
-}
-
-function rangeSnapshotKey(sourceLanguage: Source, targetLanguage: Source, dates: string[]) {
-  return `range:${sourceLanguage}:${targetLanguage}:${normalizeDateList(dates).join(",")}`;
 }
 
 function isArchiveDate(input: string) {
@@ -1415,6 +1356,7 @@ function getDifferenceKinds(pair: ArticlePair, languagePair: LanguagePairConfig)
   if (!baseArticle || !targetArticle) return [];
 
   const analysis = pair.analysis;
+  if (!analysis || analysis.analysisStatus === "unavailable") return [];
   const bodyScore = analysis?.bodyDifferenceScore ?? 0;
   const framingScore = analysis?.framingShiftScore ?? 0;
   const hasPointDiff = Boolean(
@@ -1423,8 +1365,7 @@ function getDifferenceKinds(pair: ArticlePair, languagePair: LanguagePairConfig)
   const hasBodyDiff =
     pair.status === "BODY DIFFERENCE" ||
     bodyScore >= 35 ||
-    hasPointDiff ||
-    Math.abs(baseArticle.body.length - targetArticle.body.length) > 1800;
+    hasPointDiff;
   const hasFramingDiff = pair.status === "FRAMING SHIFT" || framingScore >= 55;
 
   return [

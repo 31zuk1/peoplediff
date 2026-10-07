@@ -51,9 +51,11 @@ export type Article = {
   body: string;
   summary: string;
   keywords: string[];
+  enrichmentStatus?: "ai" | "heuristic";
 };
 
 export type DifferenceAnalysis = {
+  analysisStatus?: "ai" | "unavailable";
   sameTopic?: boolean;
   matchConfidence?: number;
   bodyDifferenceScore?: number;
@@ -134,6 +136,16 @@ export type RefreshRunMetadata = {
   durationMs: number;
   warningCount: number;
   openaiCalls: number;
+  openaiAttempts?: number;
+  openaiFailures?: number;
+  openaiCacheHits?: number;
+  openaiSkipped?: number;
+  openaiStatus?: "ok" | "degraded" | "unavailable" | "disabled" | "unused";
+  openaiErrors?: Array<{
+    category: "authentication" | "quota" | "rate_limit" | "configuration" | "timeout" | "network" | "server" | "invalid_response" | "unknown";
+    count: number;
+    status?: number;
+  }>;
   openaiInputTokens: number;
   openaiOutputTokens: number;
   openaiModelUsage?: Array<{
@@ -147,12 +159,40 @@ export type RefreshRunMetadata = {
   storageBackend: string;
 };
 
+export type ScrapeCoverage = {
+  attemptedPages: number;
+  successfulPages: number;
+  failedPages: number;
+  listingParseFailureCount: number;
+  candidateCount: number;
+  selectedCount: number;
+  articleCount: number;
+  bodyFailureCount: number;
+  articleLimitReached: boolean;
+  pageLimitReached: boolean;
+  earliestDiscoveredDate?: string;
+  latestDiscoveredDate?: string;
+  requestedDates: string[];
+  datesWithArticles: string[];
+  emptyDates: string[];
+};
+
+export type SnapshotHealth = {
+  status: "ok" | "degraded" | "empty";
+  issues: Array<{ code: string; message: string }>;
+  latestArticleDate?: string;
+  missingDates: string[];
+};
+
 export type RefreshResult = {
   generatedAt: string;
   mode: "live" | "demo" | "empty";
   collectionMode?: "broad" | "jp-major";
   model: string;
   run?: RefreshRunMetadata;
+  collection?: Partial<Record<Source, ScrapeCoverage>>;
+  health?: SnapshotHealth;
+  dailyUpdates?: Record<string, string>;
   schemaVersion?: number;
   refreshSignature?: string;
   baseLanguage?: Source;

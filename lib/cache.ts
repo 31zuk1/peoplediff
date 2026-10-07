@@ -4,11 +4,13 @@ import type {
   Article,
   ArticlePair,
   RefreshResult,
-  RefreshRunMetadata
+  RefreshRunMetadata,
+  ScrapeCoverage
 } from "./types";
 import { calculateStats, emptySnapshot } from "./compare";
 import { getAvailableLanguageSummaries, resolveCompareLanguages } from "./languages";
 import { createSnapshotStore, snapshotStorageBackend, usesDurableSnapshotStore } from "./snapshot-store";
+import { assertUsableCollection, snapshotHealth } from "./health";
 
 const LATEST_FILE = "latest.json";
 const INDEX_FILE = "index.json";
@@ -59,16 +61,24 @@ export async function readSnapshot(date?: string, options: SnapshotReadOptions =
   const archiveDates = await listArchiveDates(key);
   const windowDates = readWindowDates(archiveDates, options);
   if (windowDates.length) {
-    const aggregate = await readAggregatedSnapshot(windowDates, key);
+    const aggregate = await readAggregatedSnapshot(windowDates, key, Boolean(options.dateFrom || options.dateTo));
     if (aggregate) return aggregate;
+    if (options.dateFrom || options.dateTo) {
+      return withArchiveDates({
+        ...emptySnapshot(),
+        collectionMode: collectionModeFromKey(key),
+        baseLanguage: languageSelection.sourceLanguage,
+        targetLanguage: languageSelection.targetLanguage
+      }, undefined, key, windowDates, true);
+    }
   }
 
   const useMemoryCache = !usesDurableSnapshotStore();
   const cachedByKey = useMemoryCache ? globalThis.__PEOPLEDIFF_CACHE_BY_KEY__?.[key] : undefined;
-  if (cachedByKey) return withArchiveDates(cachedByKey, undefined, key);
+  if (cachedByKey) return withArchiveDates(cachedByKey, undefined, key, windowDates);
 
   if (useMemoryCache && key === DEFAULT_COMPARISON_KEY && globalThis.__PEOPLEDIFF_CACHE__) {
-    return withArchiveDates(globalThis.__PEOPLEDIFF_CACHE__);
+    return withArchiveDates(globalThis.__PEOPLEDIFF_CACHE__, undefined, key, windowDates);
   }
 
   const store = createSnapshotStore();
@@ -76,16 +86,18 @@ export async function readSnapshot(date?: string, options: SnapshotReadOptions =
   if (latest) {
     const cleanSnapshot = stripArchiveMetadata(latest);
     rememberSnapshot(cleanSnapshot, key);
-    return withArchiveDates(cleanSnapshot, undefined, key);
+    return withArchiveDates(cleanSnapshot, undefined, key, windowDates);
   }
 
   const latestDate = archiveDates[0];
-  if (latestDate) return readDatedSnapshot(latestDate, key);
+  if (latestDate) {
+    return withArchiveDates(await readDatedSnapshot(latestDate, key), undefined, key, windowDates);
+  }
 
   const legacy = key === DEFAULT_COMPARISON_KEY ? await store.readLegacyJson?.<RefreshResult>() : undefined;
   if (legacy) {
     globalThis.__PEOPLEDIFF_CACHE__ = stripArchiveMetadata(legacy);
-    return withArchiveDates(globalThis.__PEOPLEDIFF_CACHE__);
+    return withArchiveDates(globalThis.__PEOPLEDIFF_CACHE__, undefined, key, windowDates);
   }
 
   return withArchiveDates(
@@ -96,11 +108,13 @@ export async function readSnapshot(date?: string, options: SnapshotReadOptions =
       targetLanguage: languageSelection.targetLanguage
     },
     undefined,
-    key
+    key,
+    windowDates
   );
 }
 
 export async function writeSnapshot(snapshot: RefreshResult, options: SnapshotWriteOptions = {}) {
+  assertUsableCollection(snapshot);
   const updateLatest = options.updateLatest ?? true;
   const cleanSnapshot = stripArchiveMetadata(snapshot);
   const storedSnapshot: RefreshResult = cleanSnapshot.run
@@ -112,6 +126,14 @@ export async function writeSnapshot(snapshot: RefreshResult, options: SnapshotWr
   const store = createSnapshotStore();
   const dailySnapshots = splitSnapshotByDate(storedSnapshot);
   const key = comparisonKeyFromSnapshot(storedSnapshot);
+
+  // Validate every day before making the first write. A weekly scrape can have
+  // articles overall while failing to reach an older day, and a source lookback
+  // can contain articles even when the requested day itself could not be read.
+  await Promise.all([...dailySnapshots].map(async ([date, dailySnapshot]) => {
+    const previous = await store.readJson<RefreshResult>(datedFileName(date, key));
+    assertSafeDailyReplacement(dailySnapshot, previous, date);
+  }));
 
   await Promise.all(
     [...dailySnapshots].map(([date, dailySnapshot]) =>
@@ -156,12 +178,12 @@ async function readDatedSnapshot(date: string, key = DEFAULT_COMPARISON_KEY) {
     collectionMode: collectionModeFromKey(key),
     baseLanguage,
     targetLanguage,
-    dateScope: [date]
+    dateScope: []
   };
-  return withArchiveDates(empty, date, key);
+  return withArchiveDates(empty, date, key, [date], true);
 }
 
-async function readAggregatedSnapshot(dates: string[], key = DEFAULT_COMPARISON_KEY) {
+async function readAggregatedSnapshot(dates: string[], key = DEFAULT_COMPARISON_KEY, historical = false) {
   const store = createSnapshotStore();
   const snapshots = (
     await Promise.all(
@@ -174,13 +196,15 @@ async function readAggregatedSnapshot(dates: string[], key = DEFAULT_COMPARISON_
 
   if (!snapshots.length) return undefined;
 
-  return withArchiveDates(aggregateSnapshots(snapshots, key), undefined, key);
+  return withArchiveDates(aggregateSnapshots(snapshots, key), undefined, key, dates, historical);
 }
 
 async function withArchiveDates(
   snapshot: RefreshResult,
   activeDate?: string,
-  key = comparisonKeyFromSnapshot(snapshot)
+  key = comparisonKeyFromSnapshot(snapshot),
+  expectedDates?: string[],
+  historical = false
 ): Promise<RefreshResult> {
   const baseLanguage = snapshot.baseLanguage ?? "CN";
   const targetLanguage = snapshot.targetLanguage ?? "JP";
@@ -204,6 +228,8 @@ async function withArchiveDates(
     cnArticles: snapshot.cnArticles ?? baseArticles,
     jpArticles: targetLanguage === "JP" ? (snapshot.jpArticles ?? targetArticles) : [],
     activeDate,
+    dailyUpdates: snapshot.dailyUpdates ?? Object.fromEntries(dateScope.map((date) => [date, snapshot.generatedAt])),
+    health: snapshotHealth(snapshot, { expectedDates, historical: Boolean(activeDate) || historical }),
     archiveDates: await listArchiveDates(key)
   };
 }
@@ -224,6 +250,8 @@ function splitSnapshotByDate(snapshot: RefreshResult) {
       ...snapshot,
       activeDate: undefined,
       archiveDates: undefined,
+      health: undefined,
+      dailyUpdates: { [date]: snapshot.generatedAt },
       dateScope: [date],
       sourceDateScope: collectArticleDateScope(baseArticles),
       targetDateScope: collectArticleDateScope(targetArticles),
@@ -250,18 +278,62 @@ function splitSnapshotByDate(snapshot: RefreshResult) {
   return dailySnapshots;
 }
 
+function collectionIsIncomplete(coverage: ScrapeCoverage) {
+  return coverage.failedPages > 0 || coverage.listingParseFailureCount > 0 ||
+    coverage.bodyFailureCount > 0 || coverage.pageLimitReached || coverage.articleLimitReached;
+}
+
+function articlesForSource(snapshot: RefreshResult | undefined, source: string) {
+  if (!snapshot) return [];
+  return source === (snapshot.baseLanguage ?? "CN")
+    ? snapshot.baseArticles ?? snapshot.cnArticles ?? []
+    : snapshot.targetArticles ?? snapshot.jpArticles ?? [];
+}
+
+function assertSafeDailyReplacement(
+  snapshot: RefreshResult,
+  previous: RefreshResult | undefined,
+  date: string
+) {
+  // A stale upstream listing can return HTTP 200 and look like a valid empty
+  // day. Previously observed articles remain evidence even when that later
+  // listing no longer exposes them. New, verified empty days are still allowed.
+  for (const source of new Set([snapshot.baseLanguage ?? "CN", snapshot.targetLanguage ?? "JP"])) {
+    if (!articlesForSource(snapshot, source).length && articlesForSource(previous, source).length) {
+      throw new Error(`${date} ${source}は保存済みの記事があるため、0件の結果でアーカイブを上書きしませんでした。`);
+    }
+  }
+  for (const [source, coverage] of Object.entries(snapshot.collection ?? {})) {
+    if (!collectionIsIncomplete(coverage)) continue;
+    const nextArticles = articlesForSource(snapshot, source);
+    const previousArticles = articlesForSource(previous, source);
+    const byId = new Map(nextArticles.map((article) => [article.id, article]));
+    const wouldLoseArticles = previousArticles.some((article) => !byId.has(article.id));
+    const wouldLoseBody = previousArticles.some((article) =>
+      article.body && byId.has(article.id) && !byId.get(article.id)?.body
+    );
+    const allBodiesFailed = coverage.bodyFailureCount > 0 && nextArticles.every((article) => !article.body);
+    if (!nextArticles.length || wouldLoseArticles || wouldLoseBody || allBodiesFailed) {
+      throw new Error(
+        `${date} ${source}の収集が不完全なため、空の結果や欠落した記事・本文でアーカイブを上書きしませんでした。`
+      );
+    }
+  }
+}
+
 function aggregateSnapshots(snapshots: RefreshResult[], key: string): RefreshResult {
   const [fallbackBaseLanguage, fallbackTargetLanguage] = languagesFromKey(key);
   const baseLanguage = snapshots[0].baseLanguage ?? fallbackBaseLanguage;
   const targetLanguage = snapshots[0].targetLanguage ?? fallbackTargetLanguage;
   const collectionMode = snapshots[0].collectionMode ?? collectionModeFromKey(key);
+  const oldestFirst = [...snapshots].sort((a, b) => a.generatedAt.localeCompare(b.generatedAt));
   const baseArticles = uniqueArticles(
-    snapshots.flatMap((snapshot) => snapshot.baseArticles ?? snapshot.cnArticles ?? [])
+    oldestFirst.flatMap((snapshot) => snapshot.baseArticles ?? snapshot.cnArticles ?? [])
   );
   const targetArticles = uniqueArticles(
-    snapshots.flatMap((snapshot) => snapshot.targetArticles ?? snapshot.jpArticles ?? [])
+    oldestFirst.flatMap((snapshot) => snapshot.targetArticles ?? snapshot.jpArticles ?? [])
   );
-  const pairs = uniquePairs(snapshots.flatMap((snapshot) => snapshot.pairs));
+  const pairs = uniquePairs(snapshots);
   const anchoredPairs = uniqueAnchoredPairs(
     snapshots.flatMap((snapshot) => snapshot.anchoredPairs ?? [])
   );
@@ -291,7 +363,10 @@ function aggregateSnapshots(snapshots: RefreshResult[], key: string): RefreshRes
         : calculateStats(pairs, baseArticles.length, targetArticles.length, baseLanguage, targetLanguage),
     warnings,
     run: aggregateRunMetadata(snapshots),
-    refreshSignature: undefined
+    refreshSignature: undefined,
+    dailyUpdates: Object.assign({}, ...snapshots.map((snapshot) => snapshot.dailyUpdates ??
+      Object.fromEntries((snapshot.dateScope ?? []).map((date) => [date, snapshot.generatedAt])))),
+    collection: aggregateCollection(snapshots)
   };
 }
 
@@ -320,17 +395,20 @@ function collectSnapshotDates(snapshot: RefreshResult) {
   return [...values].sort((a, b) => b.localeCompare(a));
 }
 
-function readWindowDates(archiveDates: string[], options: SnapshotReadOptions) {
+function readWindowDates(_archiveDates: string[], options: SnapshotReadOptions) {
   const explicitRange = dateRange(
     typeof options.dateFrom === "string" ? options.dateFrom : undefined,
     typeof options.dateTo === "string" ? options.dateTo : undefined
   );
   if (explicitRange.length) {
-    const available = new Set(archiveDates);
-    return explicitRange.filter((date) => available.has(date));
+    return explicitRange;
   }
 
-  return archiveDates.slice(0, readWindowDays(options.windowDays));
+  return Array.from({ length: readWindowDays(options.windowDays) }, (_, i) => addDays(todayInJst(), -1 - i));
+}
+
+function todayInJst() {
+  return new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
 }
 
 function readWindowDays(input: unknown) {
@@ -419,8 +497,65 @@ function uniqueArticles(articles: Article[]) {
   return [...new Map(articles.map((article) => [article.id, article])).values()];
 }
 
-function uniquePairs(pairs: ArticlePair[]) {
-  return [...new Map(pairs.map((pair) => [pair.id, pair])).values()];
+function uniquePairs(snapshots: RefreshResult[]) {
+  const candidates = snapshots.flatMap((snapshot) =>
+    snapshot.pairs.map((pair) => ({ pair, generatedAt: snapshot.generatedAt }))
+  ).sort((a, b) =>
+    Number(isMatchedPair(b.pair)) - Number(isMatchedPair(a.pair)) ||
+    b.generatedAt.localeCompare(a.generatedAt) || b.pair.matchScore - a.pair.matchScore
+  );
+  const selected: ArticlePair[] = [];
+  const usedBase = new Set<string>();
+  const usedTarget = new Set<string>();
+
+  for (const { pair } of candidates) {
+    const base = pair.base ?? pair.cn;
+    const target = pair.target ?? pair.jp;
+    if ((base && usedBase.has(base.id)) || (target && usedTarget.has(target.id))) continue;
+    if (base) usedBase.add(base.id);
+    if (target) usedTarget.add(target.id);
+    selected.push(pair);
+  }
+
+  // A conflicting older match may still contain an article that is not used by
+  // the preferred match. Preserve that article as one-sided coverage.
+  for (const { pair } of candidates) {
+    const base = pair.base ?? pair.cn;
+    const target = pair.target ?? pair.jp;
+    if (base && !usedBase.has(base.id)) {
+      usedBase.add(base.id);
+      selected.push(singleArticlePair(pair, base, "base"));
+    }
+    if (target && !usedTarget.has(target.id)) {
+      usedTarget.add(target.id);
+      selected.push(singleArticlePair(pair, target, "target"));
+    }
+  }
+  return selected;
+}
+
+function isMatchedPair(pair: ArticlePair) {
+  return Boolean((pair.base ?? pair.cn) && (pair.target ?? pair.jp));
+}
+
+function singleArticlePair(pair: ArticlePair, article: Article, side: "base" | "target"): ArticlePair {
+  const base = side === "base" ? article : undefined;
+  const target = side === "target" ? article : undefined;
+  return {
+    id: `aggregate:${side}-only:${article.id}`,
+    status: base ? "CN ONLY" : article.source === "JP" ? "JP ONLY" : "TARGET ONLY",
+    visibilityStatus: base ? "BASE_ONLY" : "TARGET_ONLY",
+    base,
+    target,
+    cn: base,
+    jp: target?.source === "JP" ? target : undefined,
+    sourceLanguage: pair.sourceLanguage ?? "CN",
+    targetLanguage: pair.targetLanguage ?? "JP",
+    articlesBySource: { [article.source]: article },
+    onlySource: article.source,
+    matchScore: 0,
+    highlights: []
+  };
 }
 
 function uniqueAnchoredPairs(pairs: AnchoredArticlePair[]) {
@@ -493,7 +628,8 @@ function latestGeneratedAt(snapshots: RefreshResult[]) {
 }
 
 function aggregateRunMetadata(snapshots: RefreshResult[]): RefreshRunMetadata | undefined {
-  const runs = snapshots.map((snapshot) => snapshot.run).filter((run): run is RefreshRunMetadata => Boolean(run));
+  const runs = [...new Map(snapshots.map((snapshot) => snapshot.run)
+    .filter((run): run is RefreshRunMetadata => Boolean(run)).map((run) => [run.runId, run])).values()];
   if (!runs.length) return undefined;
 
   const modelUsage = new Map<string, {
@@ -525,6 +661,7 @@ function aggregateRunMetadata(snapshots: RefreshResult[]): RefreshRunMetadata | 
     durationMs: runs.reduce((sum, run) => sum + run.durationMs, 0),
     warningCount: runs.reduce((sum, run) => sum + run.warningCount, 0),
     openaiCalls: runs.reduce((sum, run) => sum + run.openaiCalls, 0),
+    ...aggregateAiDiagnostics(runs),
     openaiInputTokens: runs.reduce((sum, run) => sum + run.openaiInputTokens, 0),
     openaiOutputTokens: runs.reduce((sum, run) => sum + run.openaiOutputTokens, 0),
     openaiModelUsage: [...modelUsage.entries()].map(([model, usage]) => ({
@@ -539,6 +676,57 @@ function aggregateRunMetadata(snapshots: RefreshResult[]): RefreshRunMetadata | 
     ),
     storageBackend: runs[0].storageBackend
   };
+}
+
+function aggregateAiDiagnostics(runs: RefreshRunMetadata[]): Partial<RefreshRunMetadata> {
+  const diagnosed = runs.filter((run) => run.openaiStatus);
+  if (!diagnosed.length) return {};
+  const failures = runs.reduce((n, run) => n + (run.openaiFailures ?? 0), 0);
+  const successes = runs.reduce((n, run) => n + run.openaiCalls + (run.openaiCacheHits ?? 0), 0);
+  const errors = new Map<string, NonNullable<RefreshRunMetadata["openaiErrors"]>[number]>();
+  for (const run of runs) for (const error of run.openaiErrors ?? []) {
+    const key = `${error.category}:${error.status ?? ""}`;
+    errors.set(key, { ...error, count: (errors.get(key)?.count ?? 0) + error.count });
+  }
+  return {
+    openaiAttempts: runs.reduce((n, run) => n + (run.openaiAttempts ?? 0), 0),
+    openaiFailures: failures,
+    openaiCacheHits: runs.reduce((n, run) => n + (run.openaiCacheHits ?? 0), 0),
+    openaiSkipped: runs.reduce((n, run) => n + (run.openaiSkipped ?? 0), 0),
+    openaiErrors: [...errors.values()],
+    // Mixed old/new archives must not erase a known failure or suggest that all
+    // historical runs were diagnosed by the new telemetry.
+    openaiStatus: failures ? successes ? "degraded" : "unavailable"
+      : diagnosed.length !== runs.length ? "degraded"
+      : diagnosed.every((r) => r.openaiStatus === "disabled") ? "disabled"
+      : successes ? "ok" : "unused"
+  };
+}
+
+function aggregateCollection(snapshots: RefreshResult[]): RefreshResult["collection"] {
+  const result: Partial<Record<Source, ScrapeCoverage>> = {};
+  const seen = new Set<string>();
+  for (const snapshot of snapshots) for (const [source, coverage] of Object.entries(snapshot.collection ?? {})) {
+    const key = `${source}:${snapshot.run?.runId ?? snapshot.generatedAt}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const previous = result[source as Source];
+    if (!previous) {
+      result[source as Source] = { ...coverage };
+      continue;
+    }
+    for (const metric of ["attemptedPages", "successfulPages", "failedPages", "listingParseFailureCount", "candidateCount", "selectedCount", "articleCount", "bodyFailureCount"] as const) {
+      previous[metric] += coverage[metric];
+    }
+    previous.articleLimitReached ||= coverage.articleLimitReached;
+    previous.pageLimitReached ||= coverage.pageLimitReached;
+    for (const field of ["requestedDates", "datesWithArticles", "emptyDates"] as const) {
+      previous[field] = uniqueDates([...previous[field], ...coverage[field]]);
+    }
+    previous.earliestDiscoveredDate = [previous.earliestDiscoveredDate, coverage.earliestDiscoveredDate].filter(isDefinedDate).sort()[0];
+    previous.latestDiscoveredDate = [previous.latestDiscoveredDate, coverage.latestDiscoveredDate].filter(isDefinedDate).sort().at(-1);
+  }
+  return Object.keys(result).length ? result : undefined;
 }
 
 function isDefinedDate(date: string | undefined): date is string {
